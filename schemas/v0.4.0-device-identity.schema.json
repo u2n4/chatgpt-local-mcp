@@ -1,0 +1,104 @@
+{
+  "$defs": {
+    "AvailableState": {
+      "enum": [
+        "true",
+        "false",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CapabilityStatus": {
+      "description": "Truthful capability state separating implementation, authorization, availability, and verification.",
+      "properties": {
+        "authorized": {
+          "type": "boolean"
+        },
+        "available": {
+          "$ref": "#/$defs/AvailableState"
+        },
+        "implemented": {
+          "type": "boolean"
+        },
+        "last_verified_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "verified": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "implemented",
+        "authorized",
+        "available",
+        "verified",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "approved_scopes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "capabilities": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CapabilityStatus"
+      },
+      "type": "object"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "endpoint_url": {
+      "type": "string"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "last_heartbeat_at": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "paired_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "public_key_hex": {
+      "type": "string"
+    },
+    "revoked": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "host_id",
+    "display_name",
+    "public_key_hex",
+    "endpoint_url",
+    "approved_scopes",
+    "capabilities",
+    "status",
+    "paired_at",
+    "revoked"
+  ],
+  "title": "DeviceRecord",
+  "type": "object"
+}

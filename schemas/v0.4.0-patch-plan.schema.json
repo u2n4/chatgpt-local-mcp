@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "PatchEditV04": {
+      "description": "V0.4 hash-checked patch plan — backward-compatible with v0.2.0 `apply-patch-plan`.",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "expected_hash": {
+          "description": "`None` asserts file absence (create-only); `Some(sha256)` asserts exact preimage bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_postimage_hash": {
+          "description": "Expected postimage SHA-256 verified immediately after write.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "baseline_manifest_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edits": {
+      "items": {
+        "$ref": "#/$defs/PatchEditV04"
+      },
+      "type": "array"
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "patch_plan_version": {
+      "default": "0.4.0",
+      "type": "string"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "root_identity": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verification_command": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "verification_recipe": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "project_id",
+    "operation_id",
+    "edits"
+  ],
+  "title": "PatchPlanV04",
+  "type": "object"
+}

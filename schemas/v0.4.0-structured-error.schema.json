@@ -1,0 +1,92 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "enum": [
+        "BRIDGE_POLICY_DENIED",
+        "PROJECT_NOT_GRANTED",
+        "AUTH_REQUIRED",
+        "PROTOCOL_MISMATCH",
+        "TRANSIENT_DISCONNECT",
+        "DEADLINE_EXCEEDED",
+        "BACKEND_UNAVAILABLE",
+        "STALE_PRECONDITION",
+        "VERSION_CONFLICT",
+        "INVALID_ARGUMENT",
+        "METHOD_NOT_FOUND",
+        "PATH_OUTSIDE_ROOT",
+        "UNSUPPORTED_PATH_TYPE",
+        "FILE_NOT_FOUND",
+        "NOT_FOUND",
+        "ISOLATION_NOT_VERIFIED",
+        "WORKER_CAPABILITY_NOT_VERIFIED",
+        "RESOURCE_BUDGET_EXCEEDED",
+        "RESOURCE_BUSY",
+        "IDEMPOTENCY_PAYLOAD_MISMATCH",
+        "UNKNOWN_AFTER_RESTART",
+        "CONFIRMATION_REQUIRED",
+        "HARDWARE_ACTION_DENIED",
+        "DEVICE_NOT_PAIRED",
+        "STATE_ACL_UNSAFE",
+        "SCHEMA_UNSUPPORTED",
+        "INTERNAL_ERROR"
+      ],
+      "type": "string"
+    },
+    "OriginLayer": {
+      "enum": [
+        "transport",
+        "mcp_adapter",
+        "auth",
+        "policy",
+        "validation",
+        "file_service",
+        "git_engine",
+        "job_runner",
+        "containment",
+        "evidence",
+        "provider_adapter",
+        "device_channel",
+        "state_store",
+        "hardware_adapter",
+        "internal"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ErrorCode"
+    },
+    "correlation_id": {
+      "type": "string"
+    },
+    "details": true,
+    "message": {
+      "type": "string"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "origin_layer": {
+      "$ref": "#/$defs/OriginLayer"
+    },
+    "retryable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "message",
+    "retryable",
+    "origin_layer",
+    "correlation_id",
+    "next_action"
+  ],
+  "title": "StructuredError",
+  "type": "object"
+}

@@ -1,0 +1,5 @@
+Edge Project Bridge Third-Party Dependency Summary
+Rust packages (locked in Cargo.lock): 203
+Python packages (locked in uv.lock): 31
+BridgePulse packages (locked in apps/bridgepulse/package-lock.json): 90
+See SBOM-summary.json for package names and versions.

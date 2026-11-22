@@ -1,0 +1,186 @@
+{
+  "$defs": {
+    "IntegrationMode": {
+      "enum": [
+        "await_owner_review",
+        "pre_authorized_after_verified_pass"
+      ],
+      "type": "string"
+    },
+    "OfflineGrantPolicy": {
+      "enum": [
+        "deny_new_allow_running_deterministic",
+        "deny_all_when_unreachable"
+      ],
+      "type": "string"
+    },
+    "OperationCategory": {
+      "enum": [
+        "read",
+        "write",
+        "patch",
+        "checkpoint",
+        "execute_recipe",
+        "git_read",
+        "git_worktree",
+        "git_integrate",
+        "artifact_export",
+        "browser_test",
+        "desktop_inspect",
+        "telemetry_read_only"
+      ],
+      "type": "string"
+    },
+    "ResourceLimits": {
+      "properties": {
+        "max_cpu_percent": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_duration_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_memory_mb": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_output_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_processes": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_storage_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_duration_seconds",
+        "max_cpu_percent",
+        "max_memory_mb",
+        "max_processes",
+        "max_output_bytes",
+        "max_storage_bytes"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Concrete owner-approved scoped task grant envelope (§6).",
+  "properties": {
+    "allowed_recipes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "baseline_hash": {
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "expires_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "export_scope": {
+      "type": "string"
+    },
+    "grant_id": {
+      "type": "string"
+    },
+    "granting_owner": {
+      "type": "string"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "integration_mode": {
+      "$ref": "#/$defs/IntegrationMode"
+    },
+    "limits": {
+      "$ref": "#/$defs/ResourceLimits"
+    },
+    "network_destinations": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "offline_policy": {
+      "$ref": "#/$defs/OfflineGrantPolicy"
+    },
+    "permitted_categories": {
+      "items": {
+        "$ref": "#/$defs/OperationCategory"
+      },
+      "type": "array"
+    },
+    "policy_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "requester_principal": {
+      "type": "string"
+    },
+    "revoked": {
+      "type": "boolean"
+    },
+    "revoked_at": {
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "writable_paths": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "grant_id",
+    "requester_principal",
+    "granting_owner",
+    "host_id",
+    "project_id",
+    "workspace_id",
+    "baseline_hash",
+    "policy_revision",
+    "permitted_categories",
+    "writable_paths",
+    "allowed_recipes",
+    "network_destinations",
+    "export_scope",
+    "integration_mode",
+    "limits",
+    "offline_policy",
+    "expires_at",
+    "revoked",
+    "created_at"
+  ],
+  "title": "TaskGrantEnvelope",
+  "type": "object"
+}

@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "EvidenceClass": {
+      "enum": [
+        "software_unit",
+        "software_integration",
+        "recorded_log",
+        "sitl",
+        "hitl",
+        "sih",
+        "hardware_bench",
+        "flight_observation"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "allowed_outgoing_messages": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "denied_outgoing_messages": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "device_identity": {
+      "type": "string"
+    },
+    "dropouts_detected": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "evidence_class": {
+      "$ref": "#/$defs/EvidenceClass"
+    },
+    "firmware_version": {
+      "type": "string"
+    },
+    "freshness_threshold_ms": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "parser_version": {
+      "type": "string"
+    },
+    "raw_log_sha256": {
+      "type": "string"
+    },
+    "receive_timestamp_utc": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "sequence_gaps": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_timestamp_utc": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "stream_source": {
+      "type": "string"
+    },
+    "truncated_records": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "units": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "device_identity",
+    "firmware_version",
+    "stream_source",
+    "evidence_class",
+    "units",
+    "source_timestamp_utc",
+    "receive_timestamp_utc",
+    "freshness_threshold_ms",
+    "sequence_gaps",
+    "dropouts_detected",
+    "truncated_records",
+    "parser_version",
+    "raw_log_sha256",
+    "allowed_outgoing_messages",
+    "denied_outgoing_messages"
+  ],
+  "title": "TelemetryStreamHeader",
+  "type": "object"
+}

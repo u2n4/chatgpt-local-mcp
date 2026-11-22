@@ -1,0 +1,619 @@
+{
+  "$defs": {
+    "EvidenceAuthorizationGroup": {
+      "properties": {
+        "containment_probe_result": {
+          "type": "string"
+        },
+        "effective_scope": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "executor_identity": {
+          "type": "string"
+        },
+        "grant_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requester_principal": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "requester_principal",
+        "executor_identity",
+        "policy_revision",
+        "effective_scope",
+        "containment_probe_result"
+      ],
+      "type": "object"
+    },
+    "EvidenceClaim": {
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "linked_artifact_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "claim",
+        "verdict",
+        "linked_artifact_ids"
+      ],
+      "type": "object"
+    },
+    "EvidenceClass": {
+      "enum": [
+        "software_unit",
+        "software_integration",
+        "recorded_log",
+        "sitl",
+        "hitl",
+        "sih",
+        "hardware_bench",
+        "flight_observation"
+      ],
+      "type": "string"
+    },
+    "EvidenceCommandGroup": {
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "executable": {
+          "type": "string"
+        },
+        "process_start_recorded_outside_job": {
+          "type": "boolean"
+        },
+        "redacted_env_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supervisor_pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "executable",
+        "argv",
+        "cwd",
+        "redacted_env_keys",
+        "process_start_recorded_outside_job"
+      ],
+      "type": "object"
+    },
+    "EvidenceConclusionsGroup": {
+      "properties": {
+        "claims": {
+          "items": {
+            "$ref": "#/$defs/EvidenceClaim"
+          },
+          "type": "array"
+        },
+        "overall_verdict": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "provenance_disclaimer": {
+          "type": "string"
+        },
+        "reproduction_command": {
+          "type": "string"
+        },
+        "untested_areas": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "overall_verdict",
+        "claims",
+        "untested_areas",
+        "reproduction_command",
+        "provenance_disclaimer"
+      ],
+      "type": "object"
+    },
+    "EvidenceEnvironmentGroup": {
+      "properties": {
+        "architecture": {
+          "type": "string"
+        },
+        "host_name": {
+          "type": "string"
+        },
+        "isolation_backend": {
+          "type": "string"
+        },
+        "os_build": {
+          "type": "string"
+        },
+        "resolved_executable": {
+          "type": "string"
+        },
+        "resolved_executable_sha256": {
+          "type": "string"
+        },
+        "toolchain_versions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "os_build",
+        "architecture",
+        "host_name",
+        "toolchain_versions",
+        "resolved_executable",
+        "resolved_executable_sha256",
+        "isolation_backend"
+      ],
+      "type": "object"
+    },
+    "EvidenceExecutionGroup": {
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "cleanup_confirmed": {
+          "type": "boolean"
+        },
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome_triad": {
+          "$ref": "#/$defs/OutcomeTriad"
+        },
+        "partial_output": {
+          "type": "boolean"
+        },
+        "policy_denied": {
+          "type": "boolean"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "timed_out",
+        "cancelled",
+        "policy_denied",
+        "partial_output",
+        "cleanup_confirmed",
+        "outcome_triad"
+      ],
+      "type": "object"
+    },
+    "EvidenceIdentityGroup": {
+      "description": "All 11 required evidence manifest groups per Master Prompt §12.",
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "broker_version": {
+          "type": "string"
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/EvidenceClass"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "manifest_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "report_format_version": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "runner_version": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest_id",
+        "report_format_version",
+        "run_id",
+        "task_id",
+        "host_id",
+        "project_id",
+        "workspace_id",
+        "broker_version",
+        "runner_version",
+        "adapter_version",
+        "evidence_class"
+      ],
+      "type": "object"
+    },
+    "EvidenceInputsGroup": {
+      "properties": {
+        "config_hashes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "declared_units": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "random_seed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "synthetic_data": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "config_hashes",
+        "declared_units",
+        "synthetic_data"
+      ],
+      "type": "object"
+    },
+    "EvidenceSourceGroup": {
+      "properties": {
+        "base_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty_input_manifest_sha256": {
+          "type": "string"
+        },
+        "patch_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_hash_after": {
+          "type": "string"
+        },
+        "source_hash_before": {
+          "type": "string"
+        },
+        "test_suite_manifest_sha256": {
+          "type": "string"
+        },
+        "test_suite_modified": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "dirty_input_manifest_sha256",
+        "source_hash_before",
+        "source_hash_after",
+        "test_suite_manifest_sha256",
+        "test_suite_modified"
+      ],
+      "type": "object"
+    },
+    "EvidenceTestsGroup": {
+      "properties": {
+        "cases": {
+          "items": {
+            "$ref": "#/$defs/TestCaseOutcome"
+          },
+          "type": "array"
+        },
+        "discovered": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "executed": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fresh_for_run": {
+          "type": "boolean"
+        },
+        "parser_name": {
+          "type": "string"
+        },
+        "parser_version": {
+          "type": "string"
+        },
+        "passed": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "results_artifact_sha256": {
+          "type": "string"
+        },
+        "skipped": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "parser_name",
+        "parser_version",
+        "discovered",
+        "executed",
+        "passed",
+        "failed",
+        "skipped",
+        "results_artifact_sha256",
+        "fresh_for_run",
+        "cases"
+      ],
+      "type": "object"
+    },
+    "EvidenceTimeGroup": {
+      "properties": {
+        "clock_uncertainty_note": {
+          "type": "string"
+        },
+        "finished_at_utc": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "monotonic_duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "started_at_utc": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "started_at_utc",
+        "finished_at_utc",
+        "monotonic_duration_ms",
+        "clock_uncertainty_note"
+      ],
+      "type": "object"
+    },
+    "OutcomeTriad": {
+      "description": "Explicit separation of agent completion, command execution, and independent test verification.",
+      "properties": {
+        "agent_outcome": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "execution_outcome": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "soft_denied_tools": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verification_outcome": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "agent_outcome",
+        "execution_outcome",
+        "verification_outcome"
+      ],
+      "type": "object"
+    },
+    "SealedArtifactRef": {
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "capture_origin": {
+          "type": "string"
+        },
+        "export_policy": {
+          "type": "string"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "relative_path": {
+          "type": "string"
+        },
+        "secret_scan_passed": {
+          "type": "boolean"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "media_type",
+        "capture_origin",
+        "export_policy",
+        "secret_scan_passed"
+      ],
+      "type": "object"
+    },
+    "TestCaseOutcome": {
+      "properties": {
+        "duration_ms": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "type": "object"
+    },
+    "Verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "PARTIAL",
+        "BLOCKED",
+        "NOT_TESTED",
+        "STALE",
+        "CANCELLED",
+        "ENVIRONMENT_ERROR"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/SealedArtifactRef"
+      },
+      "type": "array"
+    },
+    "authorization": {
+      "$ref": "#/$defs/EvidenceAuthorizationGroup"
+    },
+    "command": {
+      "$ref": "#/$defs/EvidenceCommandGroup"
+    },
+    "conclusions": {
+      "$ref": "#/$defs/EvidenceConclusionsGroup"
+    },
+    "environment": {
+      "$ref": "#/$defs/EvidenceEnvironmentGroup"
+    },
+    "execution": {
+      "$ref": "#/$defs/EvidenceExecutionGroup"
+    },
+    "identity": {
+      "$ref": "#/$defs/EvidenceIdentityGroup"
+    },
+    "inputs": {
+      "$ref": "#/$defs/EvidenceInputsGroup"
+    },
+    "manifest_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signature_ed25519_hex": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signer_public_key_hex": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "$ref": "#/$defs/EvidenceSourceGroup"
+    },
+    "tests": {
+      "$ref": "#/$defs/EvidenceTestsGroup"
+    },
+    "time": {
+      "$ref": "#/$defs/EvidenceTimeGroup"
+    }
+  },
+  "required": [
+    "identity",
+    "authorization",
+    "source",
+    "inputs",
+    "environment",
+    "command",
+    "time",
+    "execution",
+    "tests",
+    "artifacts",
+    "conclusions"
+  ],
+  "title": "EvidenceManifest",
+  "type": "object"
+}

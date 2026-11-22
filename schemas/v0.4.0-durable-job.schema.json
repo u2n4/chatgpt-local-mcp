@@ -1,0 +1,180 @@
+{
+  "$defs": {
+    "JobState": {
+      "enum": [
+        "queued",
+        "admitted",
+        "running",
+        "input_required",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "interrupted",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "OutcomeTriad": {
+      "description": "Explicit separation of agent completion, command execution, and independent test verification.",
+      "properties": {
+        "agent_outcome": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "execution_outcome": {
+          "$ref": "#/$defs/Verdict"
+        },
+        "soft_denied_tools": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verification_outcome": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "agent_outcome",
+        "execution_outcome",
+        "verification_outcome"
+      ],
+      "type": "object"
+    },
+    "Verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "PARTIAL",
+        "BLOCKED",
+        "NOT_TESTED",
+        "STALE",
+        "CANCELLED",
+        "ENVIRONMENT_ERROR"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "dedup_key": {
+      "type": "string"
+    },
+    "evidence_manifest_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executor_identity": {
+      "type": "string"
+    },
+    "exit_code": {
+      "format": "int32",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutcomeTriad"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "output_dir": {
+      "type": "string"
+    },
+    "output_seq": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "output_truncated": {
+      "type": "boolean"
+    },
+    "payload_digest": {
+      "type": "string"
+    },
+    "pid": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "process_start_time_100ns": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "requester_principal": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/$defs/JobState"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "task_id",
+    "host_id",
+    "project_id",
+    "workspace_id",
+    "requester_principal",
+    "executor_identity",
+    "operation_id",
+    "dedup_key",
+    "payload_digest",
+    "state",
+    "output_seq",
+    "output_truncated",
+    "output_dir",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "DurableJobRecord",
+  "type": "object"
+}

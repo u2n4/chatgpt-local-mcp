@@ -1,0 +1,1585 @@
+{
+  "artifact_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List registered text artifacts for the project or task.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-zA-Z0-9_.:-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Resume",
+      "type": "object"
+    },
+    "name": "artifact_list"
+  },
+  "artifact_read": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a registered text artifact after verifying its recorded hash.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "limit": {
+          "default": 32768,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "artifact_id"
+      ],
+      "title": "ArtifactRead",
+      "type": "object"
+    },
+    "name": "artifact_read"
+  },
+  "bridge_health": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report live SQLite health, host RAM/CPU telemetry, and desktop status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Input",
+      "type": "object"
+    },
+    "name": "bridge_health"
+  },
+  "bridge_info": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report bridge identity and which capabilities are enabled.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "Input",
+      "type": "object"
+    },
+    "name": "bridge_info"
+  },
+  "connection_diagnostics": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Return redacted per-layer diagnostics and host-error classification.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "include_incidents": {
+          "default": true,
+          "title": "Include Incidents",
+          "type": "boolean"
+        },
+        "symptom": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symptom"
+        }
+      },
+      "title": "DiagnosticsInput",
+      "type": "object"
+    },
+    "name": "connection_diagnostics"
+  },
+  "file_delete": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move a hash-checked project file into reversible quarantine.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Expected Hash",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "path",
+        "expected_hash"
+      ],
+      "title": "Delete",
+      "type": "object"
+    },
+    "name": "file_delete"
+  },
+  "file_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List a scoped project directory without following links.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Cursor",
+          "type": "integer"
+        },
+        "exclude_generated": {
+          "default": true,
+          "title": "Exclude Generated",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "max_depth": {
+          "default": 3,
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Max Depth",
+          "type": "integer"
+        },
+        "path": {
+          "default": ".",
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "recursive": {
+          "default": false,
+          "title": "Recursive",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Directory",
+      "type": "object"
+    },
+    "name": "file_list"
+  },
+  "file_move": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Move a file within its project after checking the original hash.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "destination": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Destination",
+          "type": "string"
+        },
+        "expected_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Expected Hash",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "source": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "source",
+        "destination",
+        "expected_hash"
+      ],
+      "title": "Move",
+      "type": "object"
+    },
+    "name": "file_move"
+  },
+  "file_patch": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Apply hash-checked whole-text replacements with a recovery journal.",
+    "inputSchema": {
+      "$defs": {
+        "Edit": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "maxLength": 262144,
+              "title": "Content",
+              "type": "string"
+            },
+            "expected_hash": {
+              "anyOf": [
+                {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Hash"
+            },
+            "path": {
+              "maxLength": 768,
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content",
+            "expected_hash"
+          ],
+          "title": "Edit",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "edits": {
+          "items": {
+            "$ref": "#/$defs/Edit"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Edits",
+          "type": "array"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "edits"
+      ],
+      "title": "Patch",
+      "type": "object"
+    },
+    "name": "file_patch"
+  },
+  "file_read": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read one scoped text file (up to 32 MiB) and return its SHA-256 hash.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 32768,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "lossy_utf8": {
+          "default": false,
+          "title": "Lossy Utf8",
+          "type": "boolean"
+        },
+        "offset": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ],
+      "title": "Read",
+      "type": "object"
+    },
+    "name": "file_read"
+  },
+  "file_search": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Search approved text files for a literal string.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "case_sensitive": {
+          "default": false,
+          "title": "Case Sensitive",
+          "type": "boolean"
+        },
+        "cursor": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Cursor",
+          "type": "integer"
+        },
+        "exclude_generated": {
+          "default": true,
+          "title": "Exclude Generated",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 40,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "path": {
+          "default": ".",
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "query": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "query"
+      ],
+      "title": "Search",
+      "type": "object"
+    },
+    "name": "file_search"
+  },
+  "file_view": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Get file information, text slice, image preview, or safe binary metadata.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ],
+      "title": "File",
+      "type": "object"
+    },
+    "name": "file_view"
+  },
+  "file_write": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create or replace a file with an expected hash and operation ID.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "maxLength": 262144,
+          "title": "Content",
+          "type": "string"
+        },
+        "expected_hash": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Hash"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "path",
+        "content",
+        "expected_hash"
+      ],
+      "title": "Write",
+      "type": "object"
+    },
+    "name": "file_write"
+  },
+  "git_checkpoint": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Create a non-destructive git checkpoint ref without altering HEAD or index.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Checkpoint Id",
+          "type": "string"
+        },
+        "message": {
+          "default": "",
+          "maxLength": 2000,
+          "title": "Message",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "task_id",
+        "checkpoint_id"
+      ],
+      "title": "GitCheckpoint",
+      "type": "object"
+    },
+    "name": "git_checkpoint"
+  },
+  "git_diff": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read bounded git diff output within the approved project root.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "base_ref": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Ref"
+        },
+        "limit": {
+          "default": 32768,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "paths": {
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 768,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Paths"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "staged": {
+          "default": false,
+          "title": "Staged",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "GitDiff",
+      "type": "object"
+    },
+    "name": "git_diff"
+  },
+  "git_integrate": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Preview or apply fast-forward branch integration in an owner-approved repository.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "default": true,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "expected_head": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 4,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Head"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "source_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Source Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "source_ref"
+      ],
+      "title": "GitIntegrate",
+      "type": "object"
+    },
+    "name": "git_integrate"
+  },
+  "git_status": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read repository branch, HEAD commit, and working tree status within project root.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_entries": {
+          "default": 200,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max Entries",
+          "type": "integer"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "GitStatus",
+      "type": "object"
+    },
+    "name": "git_status"
+  },
+  "job_cancel": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Request cancellation of a local job and its owned Windows process tree.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "job_id"
+      ],
+      "title": "JobMutation",
+      "type": "object"
+    },
+    "name": "job_cancel"
+  },
+  "job_changes": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Preview sealed changes from a local successful job without modifying project files.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "job_id"
+      ],
+      "title": "Job",
+      "type": "object"
+    },
+    "name": "job_changes"
+  },
+  "job_get": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a durable authorized job record.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "job_id"
+      ],
+      "title": "Job",
+      "type": "object"
+    },
+    "name": "job_get"
+  },
+  "job_output": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a bounded authorized job log page.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Cursor",
+          "type": "integer"
+        },
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "limit": {
+          "default": 32768,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "job_id"
+      ],
+      "title": "JobOutput",
+      "type": "object"
+    },
+    "name": "job_output"
+  },
+  "policy_view": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read sanitized project policy, grants, and test scope status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Project",
+      "type": "object"
+    },
+    "name": "policy_view"
+  },
+  "process_input": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Bundled jobs use closed stdin.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "maxLength": 8192,
+          "title": "Content",
+          "type": "string"
+        },
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "job_id",
+        "content"
+      ],
+      "title": "ProcessInput",
+      "type": "object"
+    },
+    "name": "process_input"
+  },
+  "process_start": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Submit an approved Calculator, Blender, Python, Node, or PowerShell job recipe.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "items": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "maxItems": 48,
+          "title": "Argv",
+          "type": "array"
+        },
+        "cwd_relative": {
+          "default": ".",
+          "maxLength": 768,
+          "minLength": 1,
+          "title": "Cwd Relative",
+          "type": "string"
+        },
+        "executable": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Executable",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Task Id",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 60,
+          "maximum": 900,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "task_id",
+        "executable",
+        "argv"
+      ],
+      "title": "ProcessStart",
+      "type": "object"
+    },
+    "name": "process_start"
+  },
+  "project_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List projects granted to this authenticated adapter.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Cursor",
+          "type": "integer"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "title": "Page",
+      "type": "object"
+    },
+    "name": "project_list"
+  },
+  "project_resume": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read the model-independent checkpoint and pending work.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-zA-Z0-9_.:-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Resume",
+      "type": "object"
+    },
+    "name": "project_resume"
+  },
+  "project_status": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Return current project policy and job records.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Project",
+      "type": "object"
+    },
+    "name": "project_status"
+  },
+  "task_checkpoint": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Record visible decisions and next actions for a task.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_decisions": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 30,
+          "title": "Accepted Decisions",
+          "type": "array"
+        },
+        "changed_files": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 50,
+          "title": "Changed Files",
+          "type": "array"
+        },
+        "next_action": {
+          "default": "",
+          "maxLength": 4096,
+          "title": "Next Action",
+          "type": "string"
+        },
+        "objective": {
+          "default": "",
+          "maxLength": 4096,
+          "title": "Objective",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Task Id",
+          "type": "string"
+        },
+        "test_evidence": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "maxItems": 50,
+          "title": "Test Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "task_id",
+        "summary"
+      ],
+      "title": "Checkpoint",
+      "type": "object"
+    },
+    "name": "task_checkpoint"
+  },
+  "task_get": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a durable task record, dependencies, latest checkpoint, and recent jobs.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "task_id"
+      ],
+      "title": "TaskGet",
+      "type": "object"
+    },
+    "name": "task_get"
+  },
+  "worker_cancel": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Cancel a queued or running worker record (when workers exist).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "worker_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Worker Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "worker_id"
+      ],
+      "title": "WorkerCancel",
+      "type": "object"
+    },
+    "name": "worker_cancel"
+  },
+  "worker_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report worker profiles, records, host resource admission, and worker readiness.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-zA-Z0-9_.:-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "title": "Resume",
+      "type": "object"
+    },
+    "name": "worker_list"
+  },
+  "worker_start": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Launch a worker. Disabled until isolation and included-only use are verified.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "objective": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Objective",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Role",
+          "type": "string"
+        },
+        "scope": {
+          "items": {
+            "maxLength": 768,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 30,
+          "title": "Scope",
+          "type": "array"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "task_id",
+        "role",
+        "objective",
+        "scope"
+      ],
+      "title": "WorkerStart",
+      "type": "object"
+    },
+    "name": "worker_start"
+  },
+  "worker_steer": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Steer an owned worker job. Disabled until workers are verified.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instruction": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Instruction",
+          "type": "string"
+        },
+        "job_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Operation Id",
+          "type": "string"
+        },
+        "project_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.:-]+$",
+          "title": "Project Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "operation_id",
+        "job_id",
+        "instruction"
+      ],
+      "title": "WorkerSteer",
+      "type": "object"
+    },
+    "name": "worker_steer"
+  }
+}

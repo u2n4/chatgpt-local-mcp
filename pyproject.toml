@@ -1,0 +1,18 @@
+[project]
+name = "edge-project-bridge"
+version = "0.2.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "anyio==4.13.0",
+    "cryptography==50.0.2",
+    "mcp==1.27.0",
+    "pydantic==2.12.5",
+    "pywin32==311; sys_platform == 'win32'",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
