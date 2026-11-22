@@ -1,10 +1,10 @@
-# Installing Edge Project Bridge on Windows
+# Installing ChatGPT Local MCP (Edge Project Bridge) on Windows
 
 Edge Project Bridge lets a remote AI model read one local project folder, create new files only under `_pro\`, and queue sandboxed test runs that a local worker executes on your PC.
 
 ## Quick install
 
-Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.5.0-pre3`), and run these three steps.
+Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.5.0-pre4`), and run these three steps.
 
 ### 1. Download `install.ps1` and `SHA256SUMS.txt`
 
@@ -12,7 +12,7 @@ Public release:
 
 ```powershell
 $version = '<VERSION>'
-$base = "https://github.com/u2n4/edge-bridge/releases/download/v$version"
+$base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
 ```
@@ -21,7 +21,7 @@ Private repository (requires [GitHub CLI](https://cli.github.com/) signed in wit
 
 ```powershell
 $version = '<VERSION>'
-gh release download "v$version" --repo u2n4/edge-bridge --pattern 'install.ps1' --pattern 'SHA256SUMS.txt'
+gh release download "v$version" --repo u2n4/chatgpt-local-mcp --pattern 'install.ps1' --pattern 'SHA256SUMS.txt'
 ```
 
 ### 2. Verify `install.ps1` before running it

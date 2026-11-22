@@ -1,4 +1,10 @@
-# Edge Project Bridge
+# ChatGPT Local MCP (Edge Project Bridge)
+
+Connect ChatGPT web, or any MCP client, to one project folder on your Windows PC. The remote model reads the project, creates new files only under `_pro`, and queues sandboxed test runs. It cannot change, move or delete your files.
+
+يربط ChatGPT web، أو أي MCP client، بمجلد مشروع واحد على جهازك. الـ model يقرأ المشروع، ينشئ ملفات جديدة تحت `_pro` فقط، ويطلب تشغيل اختبارات داخل sandbox. لا يقدر يعدّل أو ينقل أو يحذف ملفاتك.
+
+ChatGPT web needs a tunnel and a connector that you set up yourself; the installer does not set them up yet. Install guide: [docs/INSTALL.md](docs/INSTALL.md).
 
 Edge Project Bridge is a Windows-local MCP broker for project-scoped reads, file edits, Git operations, durable jobs, and evidence. The repository contains the Rust canary, the BridgePulse Svelte/TypeScript UI, and the legacy Python bridge.
 

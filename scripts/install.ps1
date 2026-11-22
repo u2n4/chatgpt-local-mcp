@@ -5,7 +5,7 @@ param(
     [string]$ProjectPath,
     [string]$ZipPath,
     [string]$Version,
-    [string]$Repo = 'u2n4/edge-bridge',
+    [string]$Repo = 'u2n4/chatgpt-local-mcp',
     [string]$Sha256
 )
 
@@ -382,9 +382,9 @@ if ($projectWithSlash.StartsWith($installWithSlash, [System.StringComparison]::O
 
 if ([string]::IsNullOrWhiteSpace($ZipPath) -and [string]::IsNullOrWhiteSpace($Version)) {
     if (-not $interactive) {
-        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.5.0-pre3).'
+        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.5.0-pre4).'
     }
-    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.5.0-pre3)?'
+    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.5.0-pre4)?'
     $cleaned = Remove-OuterQuotes $answer
     if ([string]::IsNullOrWhiteSpace($cleaned)) { throw 'A release version is required when -ZipPath is not supplied.' }
     $Version = $cleaned
