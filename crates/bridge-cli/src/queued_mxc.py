@@ -8,14 +8,14 @@ import sys
 import time
 
 
-MAX_REQUEST_BYTES = 64 * 1024
+MAX_REQUEST_BYTES = 128 * 1024
 
 
 def run(request):
     sys.path.insert(0, sys.argv[1])
     from edge_bridge.broker import protected_path, require_state_writer_token, setup_state
     from edge_bridge.jobs import (
-        Jobs, POWERSHELL_PREFIX, PROJECT_TEST_COMMAND, _seal_snapshot, validate_project_test_files,
+        COMMAND, Jobs, POWERSHELL_PREFIX, PROJECT_TEST_COMMAND, _seal_snapshot, validate_project_test_files,
     )
     from edge_bridge import runner
     from edge_bridge.state import State
@@ -29,15 +29,49 @@ def run(request):
         Path(request["launch_ready"]).touch(exist_ok=False)
         if sys.stdin.buffer.readline(16) != b"start\n":
             raise runner.RunnerBlocked("QUEUE_LAUNCH_DENIED", "The owner did not authorize workload creation.")
+    is_work = False
+    max_files = 32
+    max_total_bytes = 524_288
+    max_file_bytes = 65_536
+    cpu_percent = None
     if request["recipe"] == "python_tests":
         runtime = "python"
         command = PROJECT_TEST_COMMAND
+    elif request["recipe"] == "python_tests_work":
+        is_work = True
+        runtime = "python"
+        max_files = 128
+        max_total_bytes = 4 * 1024 * 1024
+        max_file_bytes = 256 * 1024
+        test_target = request.get("test_target")
+        if test_target is not None:
+            validated_target = runner._validate_test_target(test_target)
+            command = (*COMMAND, validated_target)
+        else:
+            command = PROJECT_TEST_COMMAND
+        cpu_percent = request.get("max_cpu_percent")
+        if (
+            isinstance(cpu_percent, bool)
+            or not isinstance(cpu_percent, int)
+            or not 1 <= cpu_percent <= runner.MAX_TEST_CPU_PERCENT
+        ):
+            raise runner.RunnerBlocked("INVALID_GRANT_LIMITS", "Work runs require a valid max_cpu_percent between 1 and 50.")
     elif request["recipe"] == "powershell_script":
         runtime = "powershell"
         command = (*POWERSHELL_PREFIX, files[0])
+    elif request["recipe"] == "powershell_script_work":
+        raise runner.RunnerBlocked("POWERSHELL_SCRIPT_WORK_UNSUPPORTED", "Recipe 'powershell_script_work' is not supported.")
     else:
         raise ValueError("Unknown supervisor recipe")
-    approved = validate_project_test_files(source, runtime, files, source_allowlist=source_allowlist)
+    approved = validate_project_test_files(
+        source,
+        runtime,
+        files,
+        max_files=max_files,
+        max_total_bytes=max_total_bytes,
+        max_file_bytes=max_file_bytes,
+        source_allowlist=source_allowlist,
+    )
     require_state_writer_token()
     runner.require_execution()
     state_path = Path(request["state"])
@@ -46,17 +80,22 @@ def run(request):
     setup_state(state_path)
     state = State(state_path / "state.sqlite3")
     project = state.register_project(source["root"], "Rust queued test snapshot", source["root_identity"])
+    if is_work:
+        state.set_exec_policy(project["project_id"], max_files=max_files, max_total_bytes=max_total_bytes)
     state.set_test_scope(project["project_id"], runtime, approved)
     delegated = bool(request["delegated"])
     timeout_seconds = request["timeout_seconds"]
     max_timeout = 60 if delegated else 120
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= max_timeout:
         raise runner.RunnerBlocked("INVALID_GRANT_LIMITS", "The requested timeout_seconds cannot be applied.")
-    job_limits = runner.resolve_job_limits({
+    limits_spec = {
         "memory_bytes": request.get("max_memory_bytes", runner.MAX_TEST_MEMORY),
         "processes": request.get("max_processes", runner.MAX_TEST_PROCESSES),
         "log_bytes": request.get("max_output_bytes", runner.MAX_TEST_LOG_BYTES),
-    })
+    }
+    if is_work:
+        limits_spec["cpu_percent"] = cpu_percent
+    job_limits = runner.resolve_job_limits(limits_spec)
     if delegated:
         workspace_limit = request.get("workspace_limit", runner.MAX_WORKSPACE_BYTES)
         if isinstance(workspace_limit, bool) or not isinstance(workspace_limit, int) or not 1 <= workspace_limit <= runner.MAX_WORKSPACE_BYTES:
@@ -66,7 +105,9 @@ def run(request):
     jobs = Jobs(state, state_path, protected_path, source_allowlist=source_allowlist,
                 before_create=before_create,
                 workspace_limit=workspace_limit,
-                job_limits=job_limits)
+                job_limits=job_limits,
+                max_file_bytes=max_file_bytes,
+                workspace_poll_interval=0.025 if is_work else 0.05)
     admitted = jobs.start(
         project, "local", "rust-mxc-queue", request["run_id"], runtime,
         list(command), ".", timeout_seconds,
@@ -104,7 +145,7 @@ def run(request):
         # The supervisor confirms cleanup before publishing a terminal state. Seal
         # the input files here if its success-only postimage seal was unavailable.
         workspace = jobs._job_dir(job_id) / "workspace"
-        sealed_files = _seal_snapshot(workspace, evidence["workspace_identity"], snapshot)
+        sealed_files = _seal_snapshot(workspace, evidence["workspace_identity"], snapshot, max_file_bytes=max_file_bytes)
     baseline = {item["path"]: item["snapshot_sha256"] for item in snapshot}
     sealed = {item["path"]: item.get("sha256") for item in sealed_files}
     if workload_started and verified and baseline and sealed:

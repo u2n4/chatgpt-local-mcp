@@ -382,9 +382,9 @@ if ($projectWithSlash.StartsWith($installWithSlash, [System.StringComparison]::O
 
 if ([string]::IsNullOrWhiteSpace($ZipPath) -and [string]::IsNullOrWhiteSpace($Version)) {
     if (-not $interactive) {
-        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.5.0-pre4).'
+        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.6.0-pre1).'
     }
-    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.5.0-pre4)?'
+    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.6.0-pre1)?'
     $cleaned = Remove-OuterQuotes $answer
     if ([string]::IsNullOrWhiteSpace($cleaned)) { throw 'A release version is required when -ZipPath is not supplied.' }
     $Version = $cleaned
@@ -780,15 +780,19 @@ Write-Output 'A test run also needs the exact PowerShell 7.7.0 and Codex 0.171.0
     $newGrantContent = @'
 #Requires -Version 7
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('pro-review', 'pro-agent')]
+    [string]$Profile = 'pro-review'
+)
 
 $ErrorActionPreference = 'Stop'
 $configPath = Join-Path $PSScriptRoot 'install.json'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
-$raw = & $config.exe_path "--state-dir=$($config.state_dir)" grant-create --profile=pro-review -- $config.project_id
+$raw = & $config.exe_path "--state-dir=$($config.state_dir)" grant-create "--profile=$Profile" -- $config.project_id
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $grant = ($raw -join "`n") | ConvertFrom-Json
+Write-Output "profile: $Profile"
 Write-Output "grant_id: $($grant.grant_id)"
 Write-Output "expires_at: $($grant.expires_at)"
 Write-Output "project_id: $($grant.project_id)"
@@ -846,14 +850,14 @@ exit $LASTEXITCODE
     Write-Output ''
     Write-Output 'Next: open PowerShell 7 in the install folder and run these scripts in order:'
     Write-Output '  1. .\environment-check.ps1   (lists persistent environment entries that look like credentials)'
-    Write-Output '  2. .\new-grant.ps1           (creates a pro-review grant and prints its grant_id)'
+    Write-Output '  2. .\new-grant.ps1           (creates a pro-review grant by default; pass -Profile pro-agent for _pro\work\ editing)'
     if (-not $canBuildRuntime) {
         Write-Output '  3. Install the missing items above, open a new PowerShell 7 window, and run .\setup-worker.ps1'
-        Write-Output '  4. .\start-worker.ps1        (starts the local worker that runs queued tests)'
+        Write-Output '  4. .\start-worker.ps1        (starts the local worker that runs queued tests; --allow-work-exec is off by default)'
     } elseif ($missingTestRunPrereqs.Count -gt 0) {
         Write-Output '  3. Install the missing items above, open a new PowerShell 7 window, and run .\start-worker.ps1'
     } else {
-        Write-Output '  3. .\start-worker.ps1        (starts the local worker that runs queued tests)'
+        Write-Output '  3. .\start-worker.ps1        (starts the local worker that runs queued tests; --allow-work-exec is off by default)'
     }
     Write-Output ''
     Write-Output 'For an MCP client that starts a local program (stdio), configure:'
@@ -864,7 +868,7 @@ exit $LASTEXITCODE
     Write-Output ''
     Write-Output 'ChatGPT web cannot start a local program. It needs a tunnel and a connector that you set up yourself; this installer does not set them up.'
     Write-Output ''
-    Write-Output 'Boundary rule: under the pro-review grant, the remote model can create new files only under _pro\ (never under _pro\inbox\) and cannot change, move, or delete project files.'
+    Write-Output 'Boundary rule: under pro-review, the remote model creates new files only under _pro\ (never _pro\inbox\). Under pro-agent, it can also edit copies inside _pro\work\<workspace>\ and export diffs; project files stay read-only until you run edge-bridge work-apply --confirm.'
 } catch {
     $originalError = $_
     if (-not $installCommitted) {

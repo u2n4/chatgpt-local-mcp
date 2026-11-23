@@ -381,7 +381,7 @@ class State:
             previous = db.execute(
                 f"SELECT files FROM {table} WHERE project_id=?", (project_id,),
             ).fetchone()
-            encoded = _json(files, 8192) if files is not None else None
+            encoded = _json(files, 32_768) if files is not None else None
             changed = (previous["files"] if previous is not None else None) != encoded
             if changed:
                 if encoded is None:
@@ -721,7 +721,7 @@ class State:
             db.execute(
                 """UPDATE jobs SET status=?,exit_code=COALESCE(?,exit_code),
                    evidence=COALESCE(?,evidence),updated_at=? WHERE id=?""",
-                (status, exit_code, _json(evidence) if evidence is not None else None, _now(), job_id),
+                (status, exit_code, _json(evidence, 131_072) if evidence is not None else None, _now(), job_id),
             )
             self._event(db, row["project_id"], "job_status", {"status": status, "exit_code": exit_code}, job_id)
             return self._job(self._job_row(db, job_id))

@@ -21,6 +21,16 @@ use crate::files::ScopedFiles;
 pub const DELEGATED_WORKLOAD_REPORT_EXECUTOR: &str = "local-owner-mxc-queue-worker";
 pub const DELEGATED_WORKLOAD_REPORT_NOTE: &str =
     "The exit code and parsed test counts are reported by the workload. The signature authenticates the capture, and the device makes no independent test verdict.";
+pub const DELEGATED_WORK_COPY_EXECUTOR: &str = "local-owner-mxc-work-copy-worker";
+pub const DELEGATED_WORK_COPY_NOTE: &str =
+    "Executed a remote-modified work copy under _pro/work/; live project files were neither tested nor modified. The exit code and parsed test counts are reported by the workload, and the device makes no independent test verdict.";
+
+pub fn is_delegated_workload_executor(executor_identity: &str) -> bool {
+    matches!(
+        executor_identity,
+        DELEGATED_WORKLOAD_REPORT_EXECUTOR | DELEGATED_WORK_COPY_EXECUTOR
+    )
+}
 
 pub const PROVENANCE_DISCLAIMER: &str =
     "SHA-256 proves byte consistency and Ed25519 signatures establish attribution to the signing device key; neither proves physical-world calibration or an uncompromised host by itself.";
@@ -222,7 +232,7 @@ pub fn verify_evidence_full(
         failures.push("Manifest is missing required identity, source, command, environment, or provenance fields.".into());
     }
 
-    let recomputed = if manifest.authorization.executor_identity == DELEGATED_WORKLOAD_REPORT_EXECUTOR {
+    let recomputed = if is_delegated_workload_executor(&manifest.authorization.executor_identity) {
         delegated_workload_verdict(manifest.execution.timed_out, manifest.execution.cancelled)
     } else {
         compute_verification_verdict(
@@ -733,7 +743,7 @@ pub fn render_evidence_markdown(manifest: &EvidenceManifest) -> String {
         manifest.source.test_suite_manifest_sha256,
         manifest.manifest_sha256.as_deref().unwrap_or("unsigned"),
         manifest.signature_ed25519_hex.as_deref().unwrap_or("unsigned"),
-        if manifest.authorization.executor_identity == DELEGATED_WORKLOAD_REPORT_EXECUTOR {
+        if is_delegated_workload_executor(&manifest.authorization.executor_identity) {
             "Workload-Reported Test Counts"
         } else {
             "Test Results"
@@ -1153,5 +1163,43 @@ mod tests {
         assert!(rep3.device_key_trusted);
         assert_eq!(rep3.artifacts_hashes_verified, Some(false));
         assert!(!rep3.overall_verified);
+    }
+
+    #[test]
+    fn work_copy_executor_manifest_verifies_as_not_tested_and_rejects_pass_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let art_dir = dir.path().join("arts");
+        fs::create_dir_all(&art_dir).unwrap();
+        let log_bytes = b"test_a (tests.test_a.T) ... ok\n\nRan 1 test in 0.001s\n\nOK\n";
+        fs::write(art_dir.join("run.log"), log_bytes).unwrap();
+        let (trusted_sk, trusted_pk_hex) = load_or_create_device_signing_key(dir.path()).unwrap();
+
+        let mut work_manifest = manifest_fixture(log_bytes);
+        work_manifest.authorization.executor_identity = DELEGATED_WORK_COPY_EXECUTOR.into();
+        work_manifest.execution.outcome_triad.verification_outcome = Verdict::NotTested;
+        work_manifest.conclusions.overall_verdict = Verdict::NotTested;
+        work_manifest.conclusions.untested_areas = vec![
+            "Executed remote-modified work copy '_pro/work/fix-1'; live project files were not tested or modified.".into(),
+        ];
+        work_manifest.conclusions.provenance_disclaimer = format!("{PROVENANCE_DISCLAIMER} {DELEGATED_WORK_COPY_NOTE}");
+        seal_and_sign_manifest(&mut work_manifest, &trusted_sk);
+
+        let report = verify_evidence_full(&work_manifest, Some(&trusted_pk_hex), Some(&art_dir)).unwrap();
+        assert!(report.overall_verified, "{report:?}");
+        assert_eq!(report.reported_verdict, Verdict::NotTested);
+        assert_eq!(report.recomputed_verdict, Verdict::NotTested);
+        let md = render_evidence_markdown(&work_manifest);
+        assert!(md.contains("Workload-Reported Test Counts"));
+        assert!(md.contains("live project files were not tested or modified"));
+
+        // Claiming PASS on a work-copy run must fail verification truthfulness.
+        let mut forged_pass = work_manifest.clone();
+        forged_pass.conclusions.overall_verdict = Verdict::Pass;
+        forged_pass.execution.outcome_triad.verification_outcome = Verdict::Pass;
+        seal_and_sign_manifest(&mut forged_pass, &trusted_sk);
+        let forged_rep = verify_evidence_full(&forged_pass, Some(&trusted_pk_hex), Some(&art_dir)).unwrap();
+        assert!(!forged_rep.overall_verified);
+        assert!(!forged_rep.tests_verdict_truthful);
+        assert_eq!(forged_rep.recomputed_verdict, Verdict::NotTested);
     }
 }

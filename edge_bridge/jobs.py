@@ -28,7 +28,9 @@ BLENDER_COMMAND = ("--background", "--factory-startup", "--disable-autoexec", "-
 _ACTIVE = {"queued", "running", "cancelling"}
 _JOB_ID = re.compile(r"job_[a-f0-9]{32}\Z")
 _PS_PATH = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*/){0,5}[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:ps1|psd1|psm1|json)\Z")
+_TEST_TARGET = re.compile(r"tests\.test_[A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}\Z")
 _REVIEW_LIMIT = 65_536
+_MAX_WORK_FILE_BYTES = 256 * 1024
 _DIFF_BUDGET = 24_000
 
 
@@ -63,25 +65,34 @@ def _expected_file(fixture: Path, name: str, text: str) -> bool:
     return normalized == expected
 
 
-def _recipe_spec(executable: str, argv: list[str], cwd_relative: str) -> tuple[str, str | None]:
+def _recipe_details(executable: str, argv: list[str], cwd_relative: str) -> tuple[str, str | None, str | None]:
     if cwd_relative == ".":
         if executable == "python" and tuple(argv) == COMMAND:
-            return "calculator", None
+            return "calculator", None, None
         if executable == "python" and tuple(argv) == PROJECT_TEST_COMMAND:
-            return "project_tests", None
+            return "project_tests", None, None
+        if executable == "python" and len(argv) == 5 and tuple(argv[:4]) == COMMAND:
+            target = argv[4]
+            if isinstance(target, str) and len(target) <= 128 and _TEST_TARGET.fullmatch(target):
+                return "project_tests", None, target
         if executable == "node" and tuple(argv) == NODE_TEST_COMMAND:
-            return "node_tests", None
+            return "node_tests", None, None
         if executable == "powershell" and ((len(argv) == 4 and tuple(argv[:3]) == POWERSHELL_PREFIX) or (len(argv) == 6 and tuple(argv[:5]) == POWERSHELL_LEGACY_PREFIX)):
             script = argv[-1]
             if isinstance(script, str) and script.casefold().endswith(".ps1") and _PS_PATH.fullmatch(script):
-                return "powershell_script", script
+                return "powershell_script", script, None
         if executable == "blender" and tuple(argv) == BLENDER_COMMAND:
-            return "blender_knot", None
+            return "blender_knot", None, None
     raise JobError("EXECUTION_REQUEST_UNSUPPORTED", "Use a supported recipe with its documented arguments.")
 
 
+def _recipe_spec(executable: str, argv: list[str], cwd_relative: str) -> tuple[str, str | None]:
+    recipe, entry_script, test_target = _recipe_details(executable, argv, cwd_relative)
+    return recipe, entry_script if entry_script is not None else test_target
+
+
 def _recipe(executable: str, argv: list[str], cwd_relative: str) -> str:
-    return _recipe_spec(executable, argv, cwd_relative)[0]
+    return _recipe_details(executable, argv, cwd_relative)[0]
 
 
 def validate_project_test_files(
@@ -91,9 +102,12 @@ def validate_project_test_files(
     *,
     max_files: int = 32,
     max_total_bytes: int = 524_288,
+    max_file_bytes: int = 65_536,
     source_allowlist: frozenset[str] | None = None,
 ) -> list[str]:
     """Validate the owner-approved selection without copying or starting code."""
+    if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or not 1 <= max_file_bytes <= _MAX_WORK_FILE_BYTES:
+        raise JobError("INVALID_TEST_SCOPE", "Invalid per-file size limit for test snapshot.")
     min_files = 1 if runtime == "powershell" else 2
     if not isinstance(files, list) or not min_files <= len(files) <= max_files:
         raise JobError("INVALID_TEST_SCOPE", f"Choose between {min_files} and {max_files} supported files.")
@@ -115,7 +129,9 @@ def validate_project_test_files(
     if runtime == "node" and not any(re.fullmatch(r"tests/[A-Za-z_][A-Za-z0-9_]*\.test\.mjs", path) for path in files):
         raise JobError("INVALID_TEST_SCOPE", "Include at least one tests/*.test.mjs file.")
     source = ProjectFiles(project["root"], project["root_identity"])
-    _read_project_test_files(source, files, max_total_bytes=max_total_bytes, source_allowlist=source_allowlist)
+    _read_project_test_files(
+        source, files, max_total_bytes=max_total_bytes, max_file_bytes=max_file_bytes, source_allowlist=source_allowlist,
+    )
     return sorted(files)
 
 
@@ -124,6 +140,7 @@ def _read_project_test_files(
     files: list[str],
     *,
     max_total_bytes: int = 524_288,
+    max_file_bytes: int = 65_536,
     source_allowlist: frozenset[str] | None = None,
 ) -> list[dict]:
     items = []
@@ -131,9 +148,17 @@ def _read_project_test_files(
     for path in files:
         if source_allowlist is not None and path not in source_allowlist:
             raise JobError("BRIDGE_POLICY_DENIED", "The source path is outside the broker-approved snapshot list.")
-        item = source.read(path, limit=65_536)
+        if max_file_bytes <= 65_536:
+            item = source.read(path, limit=max_file_bytes)
+        else:
+            try:
+                item = source.read_snapshot_file(path, max_bytes=max_file_bytes)
+            except FileBoundaryError as exc:
+                if exc.code == "RESOURCE_BUDGET_EXCEEDED":
+                    raise JobError("RESOURCE_BUDGET_EXCEEDED", "A project snapshot cannot exceed its file or total size limit.") from exc
+                raise
         total += item["size"]
-        if item["truncated"] or item["size"] > 65_536 or total > max_total_bytes:
+        if item["truncated"] or item["size"] > max_file_bytes or total > max_total_bytes:
             raise JobError("RESOURCE_BUDGET_EXCEEDED", "A project snapshot cannot exceed its file or total size limit.")
         items.append(item)
     return items
@@ -155,20 +180,23 @@ def _blender_artifacts(workspace: Path) -> dict:
     return {"geometry": geometry, "files": [blend, glb]}
 
 
-def _review_text(files: ProjectFiles, path: str) -> dict:
-    item = files.read(path, limit=_REVIEW_LIMIT)
-    if item["truncated"] or item["size"] > _REVIEW_LIMIT:
-        raise JobError("RESOURCE_BUDGET_EXCEEDED", "Reviewed text cannot exceed 64 KiB.")
+def _review_text(files: ProjectFiles, path: str, *, max_bytes: int = _REVIEW_LIMIT) -> dict:
+    if max_bytes <= _REVIEW_LIMIT:
+        item = files.read(path, limit=max_bytes)
+    else:
+        item = files.read_snapshot_file(path, max_bytes=max_bytes)
+    if item["truncated"] or item["size"] > max_bytes:
+        raise JobError("RESOURCE_BUDGET_EXCEEDED", f"Reviewed text cannot exceed {max_bytes} bytes.")
     return item
 
 
-def _seal_snapshot(workspace: Path, root_identity: str, baseline: list[dict]) -> list[dict]:
+def _seal_snapshot(workspace: Path, root_identity: str, baseline: list[dict], *, max_file_bytes: int = _REVIEW_LIMIT) -> list[dict]:
     snapshot = ProjectFiles(workspace, root_identity)
     sealed = []
     for existing in baseline:
         path = existing["path"]
         try:
-            item = _review_text(snapshot, path)
+            item = _review_text(snapshot, path, max_bytes=max_file_bytes)
         except (FileBoundaryError, JobError) as failure:
             sealed.append({"path": path, "unavailable": failure.code})
         else:
@@ -181,12 +209,16 @@ class Jobs:
                  source_allowlist: frozenset[str] | None = None,
                  before_create: Callable[[], None] | None = None,
                  workspace_limit: int | None = None,
-                 job_limits: dict[str, int] | None = None):
+                 job_limits: dict[str, int] | None = None,
+                 max_file_bytes: int = _REVIEW_LIMIT,
+                 workspace_poll_interval: float = 0.05):
         if workspace_limit is not None and (
             isinstance(workspace_limit, bool) or not isinstance(workspace_limit, int)
             or not 1 <= workspace_limit <= runner.MAX_WORKSPACE_BYTES
         ):
             raise runner.RunnerBlocked("INVALID_GRANT_LIMITS", "The requested workspace_limit cannot be applied.")
+        if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or not 1 <= max_file_bytes <= _MAX_WORK_FILE_BYTES:
+            raise runner.RunnerBlocked("INVALID_GRANT_LIMITS", "The requested max_file_bytes cannot be applied.")
         self.store = store
         self.base = state_path / "jobs"
         self.protected_path = protected_path
@@ -194,13 +226,15 @@ class Jobs:
         self.before_create = before_create
         self.workspace_limit = workspace_limit
         self.job_limits = runner.resolve_job_limits(job_limits) if job_limits is not None else None
+        self.max_file_bytes = max_file_bytes
+        self.workspace_poll_interval = max(0.01, min(float(workspace_poll_interval), 0.5))
         self.lock = threading.RLock()
         self.active: ActiveJob | None = None
         self.unconfirmed_exit = False
 
     def start(self, project: dict, principal: str, task_id: str, operation_id: str,
               executable: str, argv: list[str], cwd_relative: str, timeout_seconds: int) -> dict:
-        recipe, entry_script = _recipe_spec(executable, argv, cwd_relative)
+        recipe, entry_script, test_target = _recipe_details(executable, argv, cwd_relative)
         runner.require_execution()
         with self.lock:
             if self.unconfirmed_exit:
@@ -218,6 +252,11 @@ class Jobs:
                     raise JobError(f"{runtime.upper()}_TEST_SCOPE_REQUIRED", "The local operator must approve the test file list.")
                 if entry_script is not None and entry_script not in scope["files"]:
                     raise JobError(f"{runtime.upper()}_TEST_SCOPE_REQUIRED", "The requested script is outside the approved file list.")
+                if test_target is not None:
+                    target_parts = test_target.split(".")
+                    target_file = f"{target_parts[0]}/{target_parts[1]}.py"
+                    if target_file not in scope["files"]:
+                        raise JobError("INVALID_TEST_SCOPE", "The requested test target is outside the approved file list.")
                 if len(scope["files"]) > exec_policy["max_files"]:
                     raise JobError("RESOURCE_BUDGET_EXCEEDED", "Approved scope exceeds current max_files policy.")
             job = self.store.create_job(project["project_id"], principal, task_id, operation_id, {
@@ -229,7 +268,7 @@ class Jobs:
             entry = ActiveJob(job["job_id"], project["project_id"], recipe)
             thread = threading.Thread(
                 name=f"edge-bridge-{entry.job_id}", target=self._run,
-                args=(entry, project, timeout_seconds, scope, exec_policy["max_total_bytes"], entry_script),
+                args=(entry, project, timeout_seconds, scope, exec_policy["max_total_bytes"], entry_script, test_target),
                 daemon=False,
             )
             entry.thread = thread
@@ -267,6 +306,7 @@ class Jobs:
         scope: dict | None,
         *,
         max_total_bytes: int = 524_288,
+        max_file_bytes: int = _REVIEW_LIMIT,
         source_allowlist: frozenset[str] | None = None,
     ) -> list[dict]:
         source = ProjectFiles(project["root"], project["root_identity"])
@@ -274,7 +314,11 @@ class Jobs:
         records = []
         if scope is not None:
             items = _read_project_test_files(
-                source, scope["files"], max_total_bytes=max_total_bytes, source_allowlist=source_allowlist,
+                source,
+                scope["files"],
+                max_total_bytes=max_total_bytes,
+                max_file_bytes=max_file_bytes,
+                source_allowlist=source_allowlist,
             )
             directories = set()
             for item in items:
@@ -307,6 +351,7 @@ class Jobs:
         scope: dict | None,
         max_total_bytes: int = 524_288,
         entry_script: str | None = None,
+        test_target: str | None = None,
     ) -> None:
         child = None
         exit_code = None
@@ -320,9 +365,14 @@ class Jobs:
             if entry.signal.is_set():
                 return
             workspace, control = self._dirs(entry.job_id)
+            snapshot_kwargs = {
+                "max_total_bytes": max_total_bytes,
+                "source_allowlist": self.source_allowlist,
+            }
+            if self.max_file_bytes != _REVIEW_LIMIT:
+                snapshot_kwargs["max_file_bytes"] = self.max_file_bytes
             evidence["snapshot"] = self._snapshot(
-                project, workspace, recipe, scope, max_total_bytes=max_total_bytes,
-                source_allowlist=self.source_allowlist,
+                project, workspace, recipe, scope, **snapshot_kwargs,
             )
             if scope is not None:
                 evidence["test_scope_revision"] = scope["policy_revision"]
@@ -330,6 +380,8 @@ class Jobs:
             if entry.signal.is_set():
                 return
             prepare_options = {"job_limits": self.job_limits} if self.job_limits is not None else {}
+            if test_target is not None:
+                prepare_options["test_target"] = test_target
             evidence["policy"] = runner.prepare_recipe(
                 workspace, control, recipe, cancelled=entry.signal, entry_script=entry_script,
                 **prepare_options,
@@ -339,6 +391,8 @@ class Jobs:
             options = {"before_create": self.before_create} if self.before_create is not None else {}
             if self.job_limits is not None:
                 options["job_limits"] = self.job_limits
+            if test_target is not None:
+                options["test_target"] = test_target
             child = runner.launch_recipe(
                 workspace, control, control / "job.log", recipe,
                 cancelled=entry.signal, entry_script=entry_script, **options,
@@ -359,7 +413,7 @@ class Jobs:
                 exit_code = child.poll()
                 if exit_code is not None:
                     break
-                entry.signal.wait(0.05)
+                entry.signal.wait(self.workspace_poll_interval)
             if entry.signal.is_set() and exit_code is None:
                 child.cancel()
                 exit_code = child.wait(5)
@@ -370,7 +424,10 @@ class Jobs:
                     failure = completed.capture_error
                     evidence["failure_code"] = failure
                 elif scope is not None:
-                    evidence["sealed_files"] = _seal_snapshot(workspace, evidence["workspace_identity"], evidence["snapshot"])
+                    evidence["sealed_files"] = _seal_snapshot(
+                        workspace, evidence["workspace_identity"], evidence["snapshot"],
+                        max_file_bytes=self.max_file_bytes,
+                    )
                 else:
                     evidence["artifacts"] = _blender_artifacts(workspace)
         except Exception as error:

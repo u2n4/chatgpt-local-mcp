@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import subprocess
@@ -31,10 +32,15 @@ CODEX_SHA256 = "cefea4ffee1fff04983a99c0dda99944d8b380e891e740a28b32f4b815a6e0b7
 PYTHON_ARGS = ("-I", "-S", "-B", "-m", "unittest", "-v")
 PROJECT_TEST_ARGS = ("-I", "-S", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v")
 MAX_TEST_PROCESSES = 8
+MAX_TEST_CPU_PERCENT = 50
 MAX_TEST_MEMORY = 768 * 1024 * 1024
 MAX_TEST_LOG_BYTES = 256 * 1024
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 16_384
+_JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION = 15
+_JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+_JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+_TEST_TARGET_RE = re.compile(r"tests\.test_[A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}\Z")
 BLENDER_SHA256 = "739a8167f81fc3dbcabaa448bb5335923b04c91f9a2408fd979c778e14d3d642"
 NODE_SHA256 = "14319838b3f355e0398c13569a90270bce4fc68f25189f58c59b03dadae0e6d5"
 POWERSHELL_SHA256 = "e94166ed9f376559c1359bafb08bc49e463a494c330f67644ec1d9f1ffeb5ee5"
@@ -343,10 +349,38 @@ def _command(workspace: Path, args: tuple[str, ...], executable: Path | None = N
             str(executable or _python_path()), *args]
 
 
-def _payload_command(workspace: Path, recipe: str, entry_script: str | None = None) -> list[str]:
+def _validate_test_target(test_target: str | None) -> str | None:
+    if test_target is None:
+        return None
+    if (
+        not isinstance(test_target, str)
+        or not test_target
+        or len(test_target) > 128
+        or test_target.startswith("-")
+        or not _TEST_TARGET_RE.fullmatch(test_target)
+    ):
+        raise RunnerBlocked("INVALID_ARGUMENT", "Invalid Python unittest target.")
+    return test_target
+
+
+_PROJECT_TEST_TARGET_SHIM = "import sys, unittest; sys.path.insert(0, '.'); unittest.main(module=None)"
+
+
+def _payload_command(
+    workspace: Path,
+    recipe: str,
+    entry_script: str | None = None,
+    *,
+    test_target: str | None = None,
+) -> list[str]:
+    if test_target is not None and recipe != "project_tests":
+        raise RunnerBlocked("INVALID_ARGUMENT", "test_target is only valid for project_tests.")
     if recipe == "calculator":
         return _command(workspace, PYTHON_ARGS)
     if recipe == "project_tests":
+        validated_target = _validate_test_target(test_target)
+        if validated_target is not None:
+            return _command(workspace, ("-I", "-S", "-B", "-c", _PROJECT_TEST_TARGET_SHIM, validated_target, "-v"))
         return _command(workspace, PROJECT_TEST_ARGS)
     if recipe == "node_tests":
         return _command(workspace, NODE_TEST_ARGS, _node_path())
@@ -371,7 +405,8 @@ def resolve_job_limits(job_limits: dict[str, int] | None = None) -> dict[str, in
         return defaults
     if not isinstance(job_limits, dict):
         raise RunnerBlocked("INVALID_GRANT_LIMITS", "Job limits must be a mapping.")
-    unknown = set(job_limits) - set(defaults)
+    allowed_keys = set(defaults) | {"cpu_percent"}
+    unknown = set(job_limits) - allowed_keys
     if unknown:
         raise RunnerBlocked("INVALID_GRANT_LIMITS", f"Unknown job limits: {', '.join(sorted(unknown))}.")
     resolved = {}
@@ -382,7 +417,38 @@ def resolve_job_limits(job_limits: dict[str, int] | None = None) -> dict[str, in
         if value > maximum:
             raise RunnerBlocked("INVALID_GRANT_LIMITS", f"Job limit '{key}' exceeds the recipe cap.")
         resolved[key] = value
+    if "cpu_percent" in job_limits:
+        cpu = job_limits["cpu_percent"]
+        if isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 1:
+            raise RunnerBlocked("INVALID_GRANT_LIMITS", "Job limit 'cpu_percent' must be a positive integer.")
+        if cpu > MAX_TEST_CPU_PERCENT:
+            raise RunnerBlocked("INVALID_GRANT_LIMITS", "Job limit 'cpu_percent' exceeds the recipe cap.")
+        resolved["cpu_percent"] = cpu
     return resolved
+
+
+class _JobObjectCpuRateControl(ct.Structure):
+    _fields_ = [("ControlFlags", wt.DWORD), ("CpuRate", wt.DWORD)]
+
+
+def _apply_job_cpu_hard_cap(job, cpu_percent: int) -> None:
+    if isinstance(cpu_percent, bool) or not isinstance(cpu_percent, int) or not 1 <= cpu_percent <= MAX_TEST_CPU_PERCENT:
+        raise RunnerBlocked("INVALID_GRANT_LIMITS", "Job limit 'cpu_percent' must be between 1 and 50.")
+    kernel = ct.WinDLL("kernel32", use_last_error=True)
+    kernel.SetInformationJobObject.argtypes = [wt.HANDLE, ct.c_int, ct.c_void_p, wt.DWORD]
+    kernel.SetInformationJobObject.restype = wt.BOOL
+    info = _JobObjectCpuRateControl(
+        _JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | _JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        cpu_percent * 100,
+    )
+    if not kernel.SetInformationJobObject(
+        int(job),
+        _JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,
+        ct.byref(info),
+        ct.sizeof(info),
+    ):
+        err = ct.get_last_error()
+        raise RunnerBlocked("INVALID_GRANT_LIMITS", f"Windows rejected the requested CPU hard cap (error {err}).")
 
 
 class OwnedProcess:
@@ -556,6 +622,8 @@ def _launch(argv: list[str], workspace: Path, control: Path, log_file: Path,
             win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, config)
         except pywintypes.error as error:
             raise RunnerBlocked("INVALID_GRANT_LIMITS", "Windows rejected the requested job limits.") from error
+        if limited and "cpu_percent" in limits:
+            _apply_job_cpu_hard_cap(job, limits["cpu_percent"])
         inherit = pywintypes.SECURITY_ATTRIBUTES()
         inherit.bInheritHandle = True
         if limited:
@@ -606,15 +674,17 @@ def _launch(argv: list[str], workspace: Path, control: Path, log_file: Path,
 def prepare_recipe(workspace: Path, control: Path, recipe: str,
                    cancelled: threading.Event | None = None,
                    entry_script: str | None = None,
-                   job_limits: dict[str, int] | None = None) -> dict:
+                   job_limits: dict[str, int] | None = None,
+                   test_target: str | None = None) -> dict:
     require_execution()
     if not workspace.is_absolute() or not control.is_absolute() or workspace.parent != control.parent or workspace == control:
         raise _blocked("Job workspace and controller must be isolated siblings.")
     if cancelled is not None and cancelled.is_set():
         raise RunnerBlocked("START_CANCELLED", "Job cancelled before containment preflight.")
     effective_limits = resolve_job_limits(job_limits) if (recipe in PROJECT_RECIPES or job_limits is not None) else None
+    validated_target = _validate_test_target(test_target)
     python = _python_path()
-    payload = _payload_command(workspace, recipe, entry_script=entry_script)
+    payload = _payload_command(workspace, recipe, entry_script=entry_script, test_target=validated_target)
     extra_runtime = None
     blender_digest = None
     node_digest = None
@@ -666,7 +736,8 @@ def prepare_recipe(workspace: Path, control: Path, recipe: str,
                                            win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_WAIT, 1, 1024, 1024, 0, None)
             stack.callback(pipe.Close)
             args += (str(readonly_probe), str(ipv6.getsockname()[1]), synthetic_pipe)
-        probe = _launch(_command(workspace, args), workspace, control, probe_path, cancelled, limited=strict_project)
+        probe_options = {"job_limits": effective_limits} if (strict_project and effective_limits is not None and "cpu_percent" in effective_limits) else {}
+        probe = _launch(_command(workspace, args), workspace, control, probe_path, cancelled, limited=strict_project, **probe_options)
         deadline = time.monotonic() + 20
         try:
             while probe.poll() is None:
@@ -697,6 +768,8 @@ def prepare_recipe(workspace: Path, control: Path, recipe: str,
     }
     if entry_script is not None:
         receipt["entry_script"] = entry_script
+    if validated_target is not None:
+        receipt["test_target"] = validated_target
     if extra_runtime is not None:
         receipt["read_only_runtime"].append(str(extra_runtime))
     if blender_digest is not None:
@@ -719,14 +792,18 @@ def launch_recipe(workspace: Path, control: Path, log_file: Path, recipe: str,
                   cancelled: threading.Event | None = None,
                   entry_script: str | None = None,
                   before_create: Callable[[], None] | None = None,
-                  job_limits: dict[str, int] | None = None) -> OwnedProcess:
+                  job_limits: dict[str, int] | None = None,
+                  test_target: str | None = None) -> OwnedProcess:
     try:
         receipt = json.loads((control / "verified-policy.json").read_text(encoding="utf-8"))
         current = hashlib.sha256((control / "codex-home" / "config.toml").read_bytes()).hexdigest()
     except (OSError, ValueError) as error:
         raise _blocked("The job has no completed containment preflight.") from error
     expected_entry = entry_script if entry_script is not None else receipt.get("entry_script")
-    if receipt.get("profile_sha256") != current or receipt.get("command") != _payload_command(workspace, recipe, entry_script=expected_entry):
+    expected_target = test_target if test_target is not None else receipt.get("test_target")
+    if receipt.get("profile_sha256") != current or receipt.get("command") != _payload_command(
+        workspace, recipe, entry_script=expected_entry, test_target=expected_target,
+    ):
         raise _blocked("The job policy changed after preflight.")
     limited = recipe in PROJECT_RECIPES
     effective_limits = None

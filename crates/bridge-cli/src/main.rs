@@ -90,8 +90,8 @@ enum Commands {
         project_id: String,
         #[arg(long, default_value = "executor:default")]
         requester: String,
-        /// Named profile (`pro-review`: read, git_read, create-only under `_pro/**`, and `python_tests`/`powershell_script`; `_pro/inbox/` is always read-only for delegated principals).
-        #[arg(long, value_parser = ["pro-review"], conflicts_with_all = ["writable_path", "recipe"])]
+        /// Named profile (`pro-review`: read, git_read, create-only under `_pro/**`, and `python_tests`/`powershell_script`; `pro-agent`: adds patch, `work_area` under `_pro/work/<workspace>/**`, and `python_tests_work`; `_pro/inbox/` is always read-only for delegated principals).
+        #[arg(long, value_parser = ["pro-review", "pro-agent"], conflicts_with_all = ["writable_path", "recipe"])]
         profile: Option<String>,
         /// Project-relative writable path allow pattern (repeatable). Omit for no writable paths (read and recipes only).
         #[arg(long)]
@@ -152,10 +152,14 @@ enum Commands {
         /// Drain the current queue and exit when no more requests can be claimed.
         #[arg(long)]
         once: bool,
-        /// Run delegated requests although the persistent user or machine environment holds
-        /// entries that look like credentials. A run can read them and return them to the requester.
+        /// Run standard delegated requests although the persistent user or machine environment holds
+        /// entries that look like credentials. Does NOT apply to `python_tests_work`.
         #[arg(long)]
         allow_environment_credentials: bool,
+        /// Opt in to executing `python_tests_work` against remote-modified files under `_pro/work/<workspace>/`
+        /// inside the MXC sandbox with a hard CPU cap and mandatory persistent-environment credential check.
+        #[arg(long, default_value_t = false)]
+        allow_work_exec: bool,
     },
     /// List the persistent environment entries that look like credentials (names only).
     #[cfg(windows)]
@@ -173,6 +177,14 @@ enum Commands {
         project_root: PathBuf,
         #[arg(long)]
         journal_id: String,
+    },
+    /// Preview (dry-run) or atomically apply `_pro/work/<workspace>/` changes to live project files with baseline verification and a rollback journal.
+    WorkApply {
+        project_id: String,
+        workspace: String,
+        /// Apply changes to live project files (without --confirm, prints a dry-run preview without modifying disk).
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
     },
     /// Verify an EvidenceManifest JSON file across 5 separated dimensions:
     /// signature validity, trusted device public key, disk artifact SHA-256 hashes, completeness, and verdict truthfulness.
@@ -432,42 +444,16 @@ async fn main() -> Result<()> {
             for name in &recipe {
                 validate_recipe_arg(name)?;
             }
+            let (permitted_categories, writable_paths, allowed_recipes) = resolve_grant_create_scope(
+                profile.as_deref(),
+                writable_path,
+                recipe,
+            )?;
             let store = StateStore::open(state_dir.join("state.sqlite3"))?;
             let host_id = resolve_host_id(&store, &state_dir)?;
             let proj = store.get_project(&project_id, &Principal::Local)?;
             let sf = ScopedFiles::new(&proj.root, Some(proj.root_identity.clone()))?;
             let manifest = sf.build_manifest(true)?;
-            let (permitted_categories, writable_paths, allowed_recipes) = if profile.is_some() {
-                use bridge_core::policy::{PRO_REVIEW_CATEGORIES, PRO_REVIEW_RECIPES, PRO_REVIEW_WRITABLE_PATH};
-                (
-                    PRO_REVIEW_CATEGORIES.to_vec(),
-                    vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
-                    PRO_REVIEW_RECIPES.map(str::to_owned).to_vec(),
-                )
-            } else if writable_path.is_empty() {
-                (
-                    vec![
-                        OperationCategory::Read,
-                        OperationCategory::GitRead,
-                        OperationCategory::ExecuteRecipe,
-                    ],
-                    Vec::new(),
-                    recipe,
-                )
-            } else {
-                (
-                    vec![
-                        OperationCategory::Read,
-                        OperationCategory::Write,
-                        OperationCategory::Patch,
-                        OperationCategory::Checkpoint,
-                        OperationCategory::ExecuteRecipe,
-                        OperationCategory::GitRead,
-                    ],
-                    writable_path,
-                    recipe,
-                )
-            };
             let now = Utc::now();
             let grant = TaskGrantEnvelope {
                 grant_id: GrantId::new_random(),
@@ -569,11 +555,24 @@ async fn main() -> Result<()> {
             }))?);
         }
         #[cfg(windows)]
-        Commands::Worker { runtime_root, once, allow_environment_credentials } => {
+        Commands::Worker {
+            runtime_root,
+            once,
+            allow_environment_credentials,
+            allow_work_exec,
+        } => {
             let state_dir = std::path::absolute(state_dir)?;
             let store = queued_mxc::retry_busy(|| StateStore::open_current(state_dir.join("state.sqlite3")))?;
             let host = resolve_host_id(&store, &state_dir)?;
-            queued_mxc::worker(&store, &state_dir, &host, &runtime_root, once, allow_environment_credentials)?;
+            queued_mxc::worker(
+                &store,
+                &state_dir,
+                &host,
+                &runtime_root,
+                once,
+                allow_environment_credentials,
+                allow_work_exec,
+            )?;
         }
         Commands::ApplyPatch { project_root, plan_json } => {
             let raw = std::fs::read_to_string(&plan_json)?;
@@ -600,6 +599,39 @@ async fn main() -> Result<()> {
             let jdir = state_dir.join("patch-journals");
             let restored = sf.rollback_patch_journal(&jdir, &journal_id)?;
             println!("{}", serde_json::to_string_pretty(&json!({"journal_id": journal_id, "restored_files": restored}))?);
+        }
+        Commands::WorkApply {
+            project_id,
+            workspace,
+            confirm,
+        } => {
+            let db_file = state_dir.join("state.sqlite3");
+            if !db_file.is_file() {
+                anyhow::bail!("State database not found: {}", db_file.display());
+            }
+            let store = StateStore::open(&db_file)?;
+            let proj = store.get_project(&project_id, &Principal::Local)?;
+            let jdir = state_dir.join("patch-journals");
+            let (res, journal_opt) = bridge_core::work_diff::apply_work_to_project(
+                std::path::Path::new(&proj.root),
+                &proj.root_identity,
+                &state_dir,
+                &jdir,
+                &proj.project_id,
+                &workspace,
+                confirm,
+            )?;
+            if let Some(journal) = journal_opt {
+                let _ = store.save_patch_journal(
+                    &journal.journal_id,
+                    &journal.project_id,
+                    &journal.operation_id,
+                    &journal.state,
+                    &journal.plan_sha256,
+                    &serde_json::to_string(&journal)?,
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Commands::VerifyEvidence {
             manifest_json,
@@ -885,6 +917,9 @@ fn validate_recipe_arg(name: &str) -> Result<()> {
     if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') {
         anyhow::bail!("Invalid --recipe: a recipe name has only lowercase letters, digits and '_'.");
     }
+    if name == bridge_core::policy::POWERSHELL_SCRIPT_WORK_RECIPE {
+        anyhow::bail!("POWERSHELL_SCRIPT_WORK_UNSUPPORTED: recipe 'powershell_script_work' is not supported and cannot be granted.");
+    }
     Ok(())
 }
 
@@ -910,6 +945,57 @@ fn validate_writable_path_arg(pattern: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_grant_create_scope(
+    profile: Option<&str>,
+    writable_path: Vec<String>,
+    recipe: Vec<String>,
+) -> Result<(Vec<OperationCategory>, Vec<String>, Vec<String>)> {
+    match profile {
+        Some("pro-review") => {
+            use bridge_core::policy::{
+                PRO_REVIEW_CATEGORIES, PRO_REVIEW_RECIPES, PRO_REVIEW_WRITABLE_PATH,
+            };
+            Ok((
+                PRO_REVIEW_CATEGORIES.to_vec(),
+                vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+                PRO_REVIEW_RECIPES.map(str::to_owned).to_vec(),
+            ))
+        }
+        Some("pro-agent") => {
+            use bridge_core::policy::{
+                PRO_AGENT_CATEGORIES, PRO_AGENT_RECIPES, PRO_REVIEW_WRITABLE_PATH,
+            };
+            Ok((
+                PRO_AGENT_CATEGORIES.to_vec(),
+                vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+                PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            ))
+        }
+        Some(other) => anyhow::bail!("Unsupported --profile '{other}'."),
+        None if writable_path.is_empty() => Ok((
+            vec![
+                OperationCategory::Read,
+                OperationCategory::GitRead,
+                OperationCategory::ExecuteRecipe,
+            ],
+            Vec::new(),
+            recipe,
+        )),
+        None => Ok((
+            vec![
+                OperationCategory::Read,
+                OperationCategory::Write,
+                OperationCategory::Patch,
+                OperationCategory::Checkpoint,
+                OperationCategory::ExecuteRecipe,
+                OperationCategory::GitRead,
+            ],
+            writable_path,
+            recipe,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,11 +1008,266 @@ mod tests {
         for good in ["_pro/**", "src/app.py", "**"] {
             assert!(validate_writable_path_arg(good).is_ok(), "expected acceptance for {good:?}");
         }
-        for bad in ["", "C:/owner/check.ps1", "python tests", "Python_Tests", "a-b"] {
+        for bad in ["", "C:/owner/check.ps1", "python tests", "Python_Tests", "a-b", "powershell_script_work"] {
             assert!(validate_recipe_arg(bad).is_err(), "expected rejection for {bad:?}");
         }
-        for good in ["python_tests", "powershell_script", "read_output"] {
+        for good in ["python_tests", "powershell_script", "read_output", "python_tests_work"] {
             assert!(validate_recipe_arg(good).is_ok(), "expected acceptance for {good:?}");
+        }
+    }
+
+    #[test]
+    fn grant_create_profile_pro_agent_and_powershell_work_refusal_rules() {
+        use bridge_core::policy::{
+            PRO_AGENT_CATEGORIES, PRO_AGENT_RECIPES, PRO_REVIEW_CATEGORIES, PRO_REVIEW_RECIPES,
+            PRO_REVIEW_WRITABLE_PATH,
+        };
+
+        // pro-review remains unchanged.
+        let (cats, paths, recipes) = resolve_grant_create_scope(
+            Some("pro-review"),
+            Vec::new(),
+            vec!["python_tests".into()],
+        )
+        .unwrap();
+        assert_eq!(cats, PRO_REVIEW_CATEGORIES);
+        assert_eq!(paths, vec![PRO_REVIEW_WRITABLE_PATH]);
+        assert_eq!(recipes, PRO_REVIEW_RECIPES);
+
+        // pro-agent grants python_tests_work and never includes powershell_script_work.
+        let (cats, paths, recipes) = resolve_grant_create_scope(
+            Some("pro-agent"),
+            Vec::new(),
+            vec!["python_tests".into()],
+        )
+        .unwrap();
+        assert_eq!(cats, PRO_AGENT_CATEGORIES);
+        assert_eq!(paths, vec![PRO_REVIEW_WRITABLE_PATH]);
+        assert_eq!(recipes, PRO_AGENT_RECIPES);
+        assert!(!recipes.iter().any(|r| r == "powershell_script_work"));
+
+        // CLI parsing accepts --profile pro-agent, rejects removed --allow-work-powershell,
+        // and rejects mixing --profile pro-agent with --writable-path or --recipe.
+        let parsed = Cli::try_parse_from([
+            "edge-bridge",
+            "grant-create",
+            "project_1",
+            "--profile",
+            "pro-agent",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::GrantCreate { profile, .. } => {
+                assert_eq!(profile.as_deref(), Some("pro-agent"));
+            }
+            _ => panic!("expected GrantCreate command"),
+        }
+        assert!(Cli::try_parse_from([
+            "edge-bridge",
+            "grant-create",
+            "project_1",
+            "--profile",
+            "pro-agent",
+            "--allow-work-powershell",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "edge-bridge",
+            "grant-create",
+            "project_1",
+            "--profile",
+            "pro-agent",
+            "--writable-path",
+            "_pro/**",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "edge-bridge",
+            "grant-create",
+            "project_1",
+            "--profile",
+            "pro-agent",
+            "--recipe",
+            "python_tests",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "edge-bridge",
+            "grant-create",
+            "project_1",
+            "--profile",
+            "unknown-profile",
+        ])
+        .is_err());
+
+        // Worker CLI exposes --allow-work-exec (default false) and has no credential-override flag for work runs.
+        #[cfg(windows)]
+        {
+            let default_worker = Cli::try_parse_from([
+                "edge-bridge",
+                "worker",
+                "--runtime-root",
+                "C:/runtime",
+            ])
+            .unwrap();
+            match default_worker.command {
+                Commands::Worker { allow_work_exec, .. } => assert!(!allow_work_exec),
+                _ => panic!("expected Worker command"),
+            }
+            let opt_in_worker = Cli::try_parse_from([
+                "edge-bridge",
+                "worker",
+                "--runtime-root",
+                "C:/runtime",
+                "--allow-work-exec",
+            ])
+            .unwrap();
+            match opt_in_worker.command {
+                Commands::Worker { allow_work_exec, .. } => assert!(allow_work_exec),
+                _ => panic!("expected Worker command"),
+            }
+            assert!(Cli::try_parse_from([
+                "edge-bridge",
+                "worker",
+                "--runtime-root",
+                "C:/runtime",
+                "--unsafe-allow-work-exec-with-credentials",
+            ])
+            .is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pro_agent_python_tests_work_is_allowed_to_queue_but_worker_refuses_without_allow_work_exec() {
+        struct TempCleanup(PathBuf);
+        impl Drop for TempCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = std::env::temp_dir().join(format!(
+            "eb_pro_agent_work_recipe_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _cleanup = TempCleanup(base.clone());
+        let state_dir = base.join("state");
+        let project_dir = base.join("project");
+        let runtime_dir = base.join("runtime");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(runtime_dir.join(".venv").join("Scripts")).unwrap();
+        std::fs::create_dir_all(runtime_dir.join("edge_bridge")).unwrap();
+        std::fs::write(runtime_dir.join(".venv").join("Scripts").join("python.exe"), b"").unwrap();
+        std::fs::write(runtime_dir.join("edge_bridge").join("runner.py"), b"").unwrap();
+
+        let store = StateStore::open(state_dir.join("state.sqlite3")).unwrap();
+        let host_id = resolve_host_id(&store, &state_dir).unwrap();
+        let sf = ScopedFiles::new(&project_dir, None).unwrap();
+        let rid = sf.current_root_identity().unwrap();
+        let proj = store.register_project(&project_dir, "AgentRecipeFixture", &rid).unwrap();
+        let (cats, paths, recipes) = resolve_grant_create_scope(
+            Some("pro-agent"),
+            Vec::new(),
+            vec!["python_tests".into()],
+        )
+        .unwrap();
+        let now = Utc::now();
+        let grant = TaskGrantEnvelope {
+            grant_id: GrantId::new_random(),
+            requester_principal: "executor:default".into(),
+            granting_owner: "local_owner".into(),
+            host_id: host_id.clone(),
+            project_id: ProjectId(proj.project_id.clone()),
+            workspace_id: WorkspaceId::new_random(),
+            baseline_hash: "sha256:0000".into(),
+            policy_revision: proj.policy_revision,
+            permitted_categories: cats,
+            writable_paths: paths,
+            allowed_recipes: recipes,
+            network_destinations: Vec::new(),
+            export_scope: "redacted_summary".into(),
+            integration_mode: IntegrationMode::AwaitOwnerReview,
+            limits: ResourceLimits::default(),
+            offline_policy: OfflineGrantPolicy::DenyNewAllowRunningDeterministic,
+            expires_at: now + Duration::minutes(60),
+            revoked: false,
+            revoked_at: None,
+            created_at: now,
+        };
+        store.create_task_grant(&grant).unwrap();
+
+        let disp = McpDispatcher::new(
+            store.clone(),
+            McpAdapterConfig::new(Principal::DelegatedExecutor("default".into()), host_id.clone()),
+        );
+        let submitted = disp
+            .dispatch_tool(
+                "task_submit",
+                &json!({
+                    "project_id": proj.project_id,
+                    "grant_id": grant.grant_id,
+                    "task_id": "task_work_recipe",
+                    "operation_id": "op_work_recipe",
+                    "recipe": "python_tests_work",
+                    "args": ["fix-1"],
+                }),
+            )
+            .unwrap();
+        let run_id = submitted["run_id"].as_str().unwrap().to_string();
+
+        // Worker without --allow-work-exec drains the queue and refuses python_tests_work without preparing any snapshot.
+        queued_mxc::worker(&store, &state_dir, &host_id, &runtime_dir, true, true, false).unwrap();
+        let run = store.get_durable_run(&run_id).unwrap().unwrap();
+        assert_eq!(run.state, JobState::Failed);
+        assert_eq!(
+            run.outcome.as_ref().map(|o| o.verification_outcome),
+            Some(Verdict::Blocked)
+        );
+        let chunks = store.read_run_output(&run_id, 0, 10).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|(_, stream, text)| stream == "stderr" && text.contains("WORK_EXEC_NOT_ENABLED")),
+            "expected WORK_EXEC_NOT_ENABLED in stderr, got: {chunks:?}"
+        );
+        assert!(!state_dir.join("runs").join(&run_id).exists());
+    }
+
+    #[test]
+    fn work_apply_cli_parsing_defaults_to_dry_run_and_accepts_confirm() {
+        let dry = Cli::try_parse_from(["edge-bridge", "work-apply", "proj_1", "fix-1"]).unwrap();
+        match dry.command {
+            Commands::WorkApply {
+                project_id,
+                workspace,
+                confirm,
+            } => {
+                assert_eq!(project_id, "proj_1");
+                assert_eq!(workspace, "fix-1");
+                assert!(!confirm);
+            }
+            _ => panic!("expected WorkApply command"),
+        }
+        let apply = Cli::try_parse_from([
+            "edge-bridge",
+            "work-apply",
+            "proj_1",
+            "fix-1",
+            "--confirm",
+        ])
+        .unwrap();
+        match apply.command {
+            Commands::WorkApply {
+                project_id,
+                workspace,
+                confirm,
+            } => {
+                assert_eq!(project_id, "proj_1");
+                assert_eq!(workspace, "fix-1");
+                assert!(confirm);
+            }
+            _ => panic!("expected WorkApply command"),
         }
     }
 }

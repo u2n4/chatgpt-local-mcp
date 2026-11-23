@@ -104,6 +104,7 @@ pub enum OperationCategory {
     BrowserTest,
     DesktopInspect,
     TelemetryReadOnly,
+    WorkArea,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

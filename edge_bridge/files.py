@@ -711,6 +711,21 @@ class ProjectFiles:
             "next_offset": end if end < total_chars else None, "truncated": end < total_chars,
         }
 
+    def read_snapshot_file(self, path: str, *, max_bytes: int = 65_536) -> dict:
+        """Read one whole UTF-8 snapshot file through a single verified handle, capped at 256 KiB."""
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 256 * 1024:
+            _fail("INVALID_ARGUMENT", "Snapshot file size limit must be between 1 and 262144 bytes.")
+        parts = _parts(path)
+        with self._directory(parts[:-1]) as handle, _open(handle, parts[-1]) as (child, info):
+            if info.size > max_bytes:
+                _fail("RESOURCE_BUDGET_EXCEEDED", "Snapshot file exceeds its per-file byte limit.")
+            result = _read_window_and_hash(child, info, 0, max_bytes, lossy_utf8=False)
+        return {
+            "path": "/".join(parts), "content": result["content"], "hash": result["hash"],
+            "encoding": result["encoding"], "editable": result["editable"],
+            "size": result["size"], "offset": 0, "next_offset": None, "truncated": False,
+        }
+
     def make_snapshot_directory(self, path: str) -> None:
         """Create one relative directory in a broker-owned snapshot."""
         parts = _parts(path)

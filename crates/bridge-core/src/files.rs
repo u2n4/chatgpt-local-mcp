@@ -176,8 +176,12 @@ impl Iterator for SortedWalk<'_> {
 /// Larger files are skipped by `search`.
 pub const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 32;
+pub const MAX_READ_LINES: usize = 2_000;
+pub const MAX_SEARCH_CONTEXT_LINES: usize = 5;
+pub const MAX_FILE_GLOB_BYTES: usize = 64;
+const SEARCH_REGEX_SIZE_LIMIT: usize = 256 * 1024;
 
-const GENERATED_DIRS: &[&str] = &[
+pub(crate) const GENERATED_DIRS: &[&str] = &[
     ".git",
     ".venv",
     "venv",
@@ -210,6 +214,51 @@ pub fn char_page(text: &str, offset: usize, limit: usize) -> (&str, usize, usize
         None => (rest.chars().count(), rest.len()),
     };
     (&rest[..page_bytes], start, start + page_chars, page_bytes < rest.len())
+}
+
+fn validate_file_glob(glob: &str) -> Result<(), BridgeError> {
+    if glob.is_empty()
+        || glob.len() > MAX_FILE_GLOB_BYTES
+        || !glob.is_ascii()
+        || glob.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || glob.contains(['/', '\\', ':'])
+        || glob.contains("..")
+    {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "file_glob must be 1..=64 printable ASCII characters without '/', '\\', ':' or '..'.",
+            OriginLayer::Validation,
+        ));
+    }
+    Ok(())
+}
+
+fn matches_file_glob(pattern: &str, name: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = name.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].eq_ignore_ascii_case(&txt[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 /// Folders and files that hold credentials or tool state whatever the project is, which a
@@ -298,6 +347,12 @@ pub struct FileReadResult {
     pub hash: String,
     /// SHA-256 of the returned page slice only.
     pub page_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +364,10 @@ pub struct BatchReadItemRequest {
     pub limit: usize,
     #[serde(default)]
     pub lossy_utf8: bool,
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    #[serde(default)]
+    pub end_line: Option<usize>,
 }
 
 fn default_batch_limit() -> usize {
@@ -330,6 +389,10 @@ pub struct SearchHit {
     pub path: String,
     pub line: usize,
     pub preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_before: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_after: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +418,8 @@ pub struct PatchJournalFileStep {
     pub backup_rel_path: Option<String>,
     pub postimage_sha256: String,
     pub committed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,7 +459,7 @@ pub struct ScopedFiles {
 
 pub const DELEGATED_WRITE_MAX_SCOPE_FILES: usize = 2_000;
 pub const DELEGATED_WRITE_MAX_SCOPE_BYTES: u64 = 256 * 1024 * 1024;
-const DELEGATED_WRITE_MAX_WALK_ENTRIES: usize = 8_192;
+pub(crate) const DELEGATED_WRITE_MAX_WALK_ENTRIES: usize = 8_192;
 const DELEGATED_CREATE_ONLY_NEXT_ACTION: &str =
     "Choose a new file name inside the granted writable path; delegated writes are create-only and cannot overwrite existing files.";
 
@@ -405,15 +470,15 @@ struct DelegatedPatch<'a> {
 }
 
 #[cfg(windows)]
-struct PatchParent {
-    directories: Vec<File>,
-    root_path: PathBuf,
-    path: PathBuf,
+pub(crate) struct PatchParent {
+    pub(crate) directories: Vec<File>,
+    pub(crate) root_path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 #[cfg(windows)]
 impl PatchParent {
-    fn pin(
+    pub(crate) fn pin(
         root: &Path,
         root_identity: &str,
         path: &str,
@@ -435,7 +500,12 @@ impl PatchParent {
         let mut directories = vec![root];
         for segment in parents {
             let requested = current.join(segment);
-            if !requested.try_exists().map_err(patch_io_error)? {
+            let exists = match fs::symlink_metadata(&requested) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(patch_io_error(error)),
+            };
+            if !exists {
                 if !create_missing {
                     break;
                 }
@@ -452,7 +522,14 @@ impl PatchParent {
             let pinned = open_patch_directory(&requested).map_err(patch_io_error)?;
             let identity = file_identity_from_handle(&pinned)?;
             let observed = file_path_from_handle(&pinned)?;
-            if !identity.is_directory || identity.is_reparse_point || observed.parent() != Some(current.as_path()) {
+            if !identity.is_directory || identity.is_reparse_point {
+                return Err(BridgeError::new(
+                    ErrorCode::UnsupportedPathType,
+                    format!("Reparse point or non-directory denied while pinning parent of '{path}'."),
+                    OriginLayer::FileService,
+                ));
+            }
+            if observed.parent() != Some(current.as_path()) {
                 return Err(patch_commit_conflict(path));
             }
             if delegated {
@@ -464,7 +541,54 @@ impl PatchParent {
         Ok(Self { directories, root_path, path: current })
     }
 
-    fn verify_location(&self, relative: &str) -> Result<(), BridgeError> {
+    /// Pin an existing directory and every ancestor up to `root`, verifying non-reparse directory
+    /// identity and exact on-disk casing at every hop. Returns `Ok(None)` if any segment along
+    /// `dir_rel` does not exist on disk (after validating all existing prefix segments).
+    pub(crate) fn pin_dir_existing(
+        root: &Path,
+        root_identity: &str,
+        dir_rel: &str,
+        delegated: bool,
+    ) -> Result<Option<Self>, BridgeError> {
+        let parts = validate_relative_path(dir_rel)?;
+        let root_handle = open_patch_directory(root).map_err(patch_io_error)?;
+        let identity = file_identity_from_handle(&root_handle)?;
+        if !identity.is_directory || identity.is_reparse_point || identity.canonical_id() != root_identity {
+            return Err(patch_commit_conflict(dir_rel));
+        }
+        let root_path = file_path_from_handle(&root_handle)?;
+        let mut current = root_path.clone();
+        let mut directories = vec![root_handle];
+        for segment in &parts {
+            let requested = current.join(segment);
+            match fs::symlink_metadata(&requested) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(patch_io_error(error)),
+            }
+            let pinned = open_patch_directory(&requested).map_err(patch_io_error)?;
+            let identity = file_identity_from_handle(&pinned)?;
+            let observed = file_path_from_handle(&pinned)?;
+            if !identity.is_directory || identity.is_reparse_point {
+                return Err(BridgeError::new(
+                    ErrorCode::UnsupportedPathType,
+                    format!("Reparse point or non-directory denied at '{dir_rel}'."),
+                    OriginLayer::FileService,
+                ));
+            }
+            if observed.parent() != Some(current.as_path()) {
+                return Err(patch_commit_conflict(dir_rel));
+            }
+            if delegated {
+                verify_delegated_parent_name(&root_path, &requested, &observed)?;
+            }
+            current = observed;
+            directories.push(pinned);
+        }
+        Ok(Some(Self { directories, root_path, path: current }))
+    }
+
+    pub(crate) fn verify_location(&self, relative: &str) -> Result<(), BridgeError> {
         if file_path_from_handle(&self.directories[0])? != self.root_path
             || file_path_from_handle(self.directories.last().unwrap())? != self.path {
             return Err(patch_commit_conflict(relative));
@@ -474,7 +598,7 @@ impl PatchParent {
 }
 
 #[cfg(windows)]
-fn unexpected_opened_name() -> BridgeError {
+pub(crate) fn unexpected_opened_name() -> BridgeError {
     BridgeError::new(
         ErrorCode::BridgePolicyDenied,
         "Opened path has a different or protected name. Use its exact long name.",
@@ -486,7 +610,7 @@ fn unexpected_opened_name() -> BridgeError {
 }
 
 #[cfg(windows)]
-fn verify_opened_name(root: &Path, requested_relative: &Path, observed: &Path) -> Result<(), BridgeError> {
+pub(crate) fn verify_opened_name(root: &Path, requested_relative: &Path, observed: &Path) -> Result<(), BridgeError> {
     let relative = observed.strip_prefix(root).map_err(|_| unexpected_opened_name())?;
     let parts = relative.components().map(|part| {
         part.as_os_str().to_str().map(str::to_owned).ok_or_else(unexpected_opened_name)
@@ -498,13 +622,13 @@ fn verify_opened_name(root: &Path, requested_relative: &Path, observed: &Path) -
 }
 
 #[cfg(windows)]
-fn verify_delegated_parent_name(root: &Path, requested: &Path, observed: &Path) -> Result<(), BridgeError> {
+pub(crate) fn verify_delegated_parent_name(root: &Path, requested: &Path, observed: &Path) -> Result<(), BridgeError> {
     let relative = requested.strip_prefix(root).map_err(|_| unexpected_opened_name())?;
     verify_opened_name(root, relative, observed)
 }
 
 #[cfg(windows)]
-fn verify_remote_file(root: &Path, relative: &Path, file: &File, identity: &bridge_platform::FileIdentity) -> Result<(), BridgeError> {
+pub(crate) fn verify_remote_file(root: &Path, relative: &Path, file: &File, identity: &bridge_platform::FileIdentity) -> Result<(), BridgeError> {
     if identity.is_directory || identity.is_reparse_point || identity.n_links != 1 {
         return Err(unexpected_opened_name());
     }
@@ -658,7 +782,7 @@ impl DelegatedStage {
     }
 }
 
-fn is_quota_link(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_quota_link(meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -669,7 +793,50 @@ fn is_quota_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-fn check_delegated_write_quota(
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DelegatedQuotaUsage {
+    pub files: usize,
+    pub bytes: u64,
+    pub walk_entries: usize,
+}
+
+pub(crate) fn measure_delegated_folder_quota(root: &Path, folder: &str) -> Result<DelegatedQuotaUsage, BridgeError> {
+    let start = root.join(folder);
+    let mut usage = DelegatedQuotaUsage::default();
+    let mut pending = vec![start.clone()];
+    while let Some(directory) = pending.pop() {
+        let meta = match fs::symlink_metadata(&directory) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory == start => continue,
+            Err(error) => return Err(patch_io_error(error)),
+        };
+        if is_quota_link(&meta) || !meta.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&directory).map_err(patch_io_error)?;
+        for entry in entries {
+            let entry = entry.map_err(patch_io_error)?;
+            usage.walk_entries += 1;
+            if usage.walk_entries > DELEGATED_WRITE_MAX_WALK_ENTRIES {
+                return Err(BridgeError::new(
+                    ErrorCode::ResourceBudgetExceeded,
+                    "Delegated write quota or scan limit exceeded. Ask the owner to clear old files and empty directories from the granted folder.",
+                    OriginLayer::FileService,
+                ));
+            }
+            let meta = fs::symlink_metadata(entry.path()).map_err(patch_io_error)?;
+            if meta.is_dir() && !is_quota_link(&meta) {
+                pending.push(entry.path());
+            } else {
+                usage.files += 1;
+                usage.bytes = usage.bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(usage)
+}
+
+pub(crate) fn check_delegated_write_quota(
     root: &Path,
     folders: BTreeMap<&str, (usize, u64)>,
     missing_dirs: &BTreeSet<PathBuf>,
@@ -1007,6 +1174,19 @@ impl ScopedFiles {
         cursor: usize,
         limit: usize,
     ) -> Result<(Vec<FileEntry>, Option<usize>), BridgeError> {
+        self.list_with_max_limit(rel, recursive, max_depth, exclude_generated, cursor, limit, 100)
+    }
+
+    pub fn list_with_max_limit(
+        &self,
+        rel: &str,
+        recursive: bool,
+        max_depth: usize,
+        exclude_generated: bool,
+        cursor: usize,
+        limit: usize,
+        max_limit: usize,
+    ) -> Result<(Vec<FileEntry>, Option<usize>), BridgeError> {
         let (_, dir_path) = self.resolve_checked(rel, true)?;
         #[cfg(windows)]
         let _guard = self.pin_read_start(&dir_path, rel)?;
@@ -1053,7 +1233,7 @@ impl ScopedFiles {
                 size,
             });
         }
-        let cap = limit.clamp(1, 100);
+        let cap = limit.clamp(1, max_limit.max(1));
         let total = items.len();
         let slice: Vec<FileEntry> = items.into_iter().skip(cursor).take(cap).collect();
         let next = if cursor + slice.len() < total {
@@ -1071,6 +1251,57 @@ impl ScopedFiles {
         limit: usize,
         lossy_utf8: bool,
     ) -> Result<FileReadResult, BridgeError> {
+        self.read_with_options(rel, offset, limit, lossy_utf8, None, None)
+    }
+
+    pub fn read_with_options(
+        &self,
+        rel: &str,
+        offset: usize,
+        limit: usize,
+        lossy_utf8: bool,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) -> Result<FileReadResult, BridgeError> {
+        let line_range = match (start_line, end_line) {
+            (None, None) => None,
+            (s, e) => {
+                if offset > 0 {
+                    return Err(BridgeError::new(
+                        ErrorCode::InvalidArgument,
+                        "Cannot combine 'offset' > 0 with 'start_line' or 'end_line'.",
+                        OriginLayer::Validation,
+                    ));
+                }
+                if s == Some(0) || e == Some(0) {
+                    return Err(BridgeError::new(
+                        ErrorCode::InvalidArgument,
+                        "Line numbers are 1-based; 'start_line' and 'end_line' must be >= 1.",
+                        OriginLayer::Validation,
+                    ));
+                }
+                let start = s.unwrap_or(1);
+                if let Some(end) = e {
+                    if end < start {
+                        return Err(BridgeError::new(
+                            ErrorCode::InvalidArgument,
+                            "'end_line' must be >= 'start_line'.",
+                            OriginLayer::Validation,
+                        ));
+                    }
+                    if end - start >= MAX_READ_LINES {
+                        return Err(BridgeError::new(
+                            ErrorCode::InvalidArgument,
+                            format!(
+                                "Line range may span at most {MAX_READ_LINES} lines (end_line - start_line < {MAX_READ_LINES})."
+                            ),
+                            OriginLayer::Validation,
+                        ));
+                    }
+                }
+                Some((start, e))
+            }
+        };
         let (canonical_rel, full_path) = self.resolve_checked(rel, true)?;
         #[cfg(windows)]
         let pre_id = file_identity_no_follow_named(&full_path, &canonical_rel)?;
@@ -1165,9 +1396,68 @@ impl ScopedFiles {
             }
         };
 
-        let (page, start, end, truncated) = char_page(&text, offset, limit.clamp(1, MAX_PAGE_BYTES));
-        let page = page.to_string();
-        let next_offset = if truncated { Some(end) } else { None };
+        let cap_chars = limit.clamp(1, MAX_PAGE_BYTES);
+        let (page, start, next_offset, truncated, res_total_lines, res_start_line, res_end_line) =
+            if let Some((req_start, req_end)) = line_range {
+                let mut total_lines = 0usize;
+                let mut range_start_byte: Option<usize> = None;
+                let mut range_end_byte: usize = 0;
+                let max_end_line = req_end.unwrap_or_else(|| req_start.saturating_add(MAX_READ_LINES - 1));
+                let mut byte_pos = 0usize;
+                for line in text.split_inclusive('\n') {
+                    total_lines += 1;
+                    let line_end = byte_pos + line.len();
+                    if total_lines == req_start {
+                        range_start_byte = Some(byte_pos);
+                    }
+                    if total_lines >= req_start && total_lines <= max_end_line {
+                        range_end_byte = line_end;
+                    }
+                    byte_pos = line_end;
+                }
+                if let Some(start_byte) = range_start_byte {
+                    let start_char = text[..start_byte].chars().count();
+                    let range_slice = &text[start_byte..range_end_byte];
+                    let (sliced, _, page_chars, cut_by_chars) = char_page(range_slice, 0, cap_chars);
+                    let cut_by_line_cap = req_end.is_none() && total_lines > max_end_line;
+                    let truncated = cut_by_chars || cut_by_line_cap;
+                    let next_offset = if truncated {
+                        Some(start_char + page_chars)
+                    } else {
+                        None
+                    };
+                    let returned_lines = sliced.split_inclusive('\n').count();
+                    let actual_end_line = if returned_lines > 0 {
+                        Some(req_start + returned_lines - 1)
+                    } else {
+                        None
+                    };
+                    let actual_start_line = actual_end_line.map(|_| req_start);
+                    (
+                        sliced.to_string(),
+                        start_char,
+                        next_offset,
+                        truncated,
+                        Some(total_lines),
+                        actual_start_line,
+                        actual_end_line,
+                    )
+                } else {
+                    (
+                        String::new(),
+                        text.chars().count(),
+                        None,
+                        false,
+                        Some(total_lines),
+                        None,
+                        None,
+                    )
+                }
+            } else {
+                let (page, start, end, truncated) = char_page(&text, offset, cap_chars);
+                let next_offset = if truncated { Some(end) } else { None };
+                (page.to_string(), start, next_offset, truncated, None, None, None)
+            };
         let page_hash = sha256_bytes(page.as_bytes());
 
         Ok(FileReadResult {
@@ -1182,6 +1472,9 @@ impl ScopedFiles {
             line_ending: line_ending.to_string(),
             hash: full_hash,
             page_hash,
+            total_lines: res_total_lines,
+            start_line: res_start_line,
+            end_line: res_end_line,
         })
     }
 
@@ -1197,7 +1490,7 @@ impl ScopedFiles {
         }
         let mut results = Vec::with_capacity(items.len());
         for req in items {
-            match self.read(&req.path, req.offset, req.limit, req.lossy_utf8) {
+            match self.read_with_options(&req.path, req.offset, req.limit, req.lossy_utf8, req.start_line, req.end_line) {
                 Ok(r) => results.push(BatchReadItemResult {
                     path: req.path.clone(),
                     ok: true,
@@ -1223,6 +1516,21 @@ impl ScopedFiles {
         exclude_generated: bool,
         case_sensitive: bool,
     ) -> Result<Vec<SearchHit>, BridgeError> {
+        self.search_with_options(rel, query, limit, exclude_generated, case_sensitive, 0, None, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_options(
+        &self,
+        rel: &str,
+        query: &str,
+        limit: usize,
+        exclude_generated: bool,
+        case_sensitive: bool,
+        context_lines: usize,
+        file_glob: Option<&str>,
+        use_regex: bool,
+    ) -> Result<Vec<SearchHit>, BridgeError> {
         if query.is_empty() || query.len() > 200 {
             return Err(BridgeError::new(
                 ErrorCode::InvalidArgument,
@@ -1230,11 +1538,40 @@ impl ScopedFiles {
                 OriginLayer::Validation,
             ));
         }
+        if context_lines > MAX_SEARCH_CONTEXT_LINES {
+            return Err(BridgeError::new(
+                ErrorCode::InvalidArgument,
+                format!("context_lines must be between 0 and {MAX_SEARCH_CONTEXT_LINES}."),
+                OriginLayer::Validation,
+            ));
+        }
+        if let Some(glob) = file_glob {
+            validate_file_glob(glob)?;
+        }
+        let compiled_regex = if use_regex {
+            let re = regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .size_limit(SEARCH_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(SEARCH_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|e| {
+                    BridgeError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("Invalid or oversized regex pattern: {e}"),
+                        OriginLayer::Validation,
+                    )
+                })?;
+            Some(re)
+        } else {
+            None
+        };
         let (_, base_dir) = self.resolve_checked(rel, true)?;
         #[cfg(windows)]
         let mut start_guard = self.pin_read_start(&base_dir, rel)?;
         let cap = limit.clamp(1, 100);
-        let needle = if case_sensitive {
+        let needle = if compiled_regex.is_some() {
+            String::new()
+        } else if case_sensitive {
             query.to_string()
         } else {
             query.to_ascii_lowercase()
@@ -1253,6 +1590,16 @@ impl ScopedFiles {
             let ent = entry?;
             if !ent.file_type.is_file() {
                 continue;
+            }
+            if let Some(glob) = file_glob {
+                let matches_name = ent
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| matches_file_glob(glob, name));
+                if !matches_name {
+                    continue;
+                }
             }
             if fs::symlink_metadata(&ent.path).map(|m| m.len()).unwrap_or(0) > MAX_SEARCH_FILE_BYTES {
                 continue;
@@ -1277,20 +1624,52 @@ impl ScopedFiles {
             }
             let Ok(text) = std::str::from_utf8(&raw) else { continue };
             let rel_posix = rel_p.to_string_lossy().replace('\\', "/");
-            for (idx, line) in text.lines().enumerate() {
-                let matched = if case_sensitive {
+            let line_matches = |line: &str| -> bool {
+                if let Some(ref re) = compiled_regex {
+                    re.is_match(line)
+                } else if case_sensitive {
                     line.contains(&needle)
                 } else {
                     line.to_ascii_lowercase().contains(&needle)
-                };
-                if matched {
-                    hits.push(SearchHit {
-                        path: rel_posix.clone(),
-                        line: idx + 1,
-                        preview: line.chars().take(240).collect(),
-                    });
-                    if hits.len() >= cap {
-                        break;
+                }
+            };
+            if context_lines == 0 {
+                for (idx, line) in text.lines().enumerate() {
+                    if line_matches(line) {
+                        hits.push(SearchHit {
+                            path: rel_posix.clone(),
+                            line: idx + 1,
+                            preview: line.chars().take(240).collect(),
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        });
+                        if hits.len() >= cap {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let lines: Vec<&str> = text.lines().collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if line_matches(line) {
+                        let before_start = idx.saturating_sub(context_lines);
+                        let after_end = (idx + 1 + context_lines).min(lines.len());
+                        hits.push(SearchHit {
+                            path: rel_posix.clone(),
+                            line: idx + 1,
+                            preview: line.chars().take(240).collect(),
+                            context_before: lines[before_start..idx]
+                                .iter()
+                                .map(|l| l.chars().take(240).collect())
+                                .collect(),
+                            context_after: lines[(idx + 1)..after_end]
+                                .iter()
+                                .map(|l| l.chars().take(240).collect())
+                                .collect(),
+                        });
+                        if hits.len() >= cap {
+                            break;
+                        }
                     }
                 }
             }
@@ -1352,6 +1731,446 @@ impl ScopedFiles {
             authorize_commit: &authorize_commit,
             remove_stage: |path| fs::remove_file(path),
         }))
+    }
+
+    /// Apply create or hash-checked overwrite edits strictly inside exact-case `_pro/work/<workspace>/**`.
+    ///
+    /// Enforces defense-in-depth path checks (`is_pro_work_file_path`), handle-pinned parents with exact
+    /// casing and reparse-point refusal, single-link preimage checks (`n_links == 1`), net positive quota
+    /// delta accounting against the `_pro/` folder limits, per-file commit-time re-authorization, and
+    /// atomic rollback restoring original bytes on failure.
+    pub fn apply_delegated_work_edits(
+        &self,
+        plan: &PatchPlanV04,
+        journal_dir: &Path,
+        scope: &[String],
+        authorize_commit: impl Fn(&str) -> Result<(), BridgeError>,
+    ) -> Result<(PatchApplyResult, PatchJournal), BridgeError> {
+        if plan.edits.is_empty() || plan.edits.len() > 64 {
+            return Err(BridgeError::new(
+                ErrorCode::InvalidArgument,
+                "Patch plan must contain between 1 and 64 edits.",
+                OriginLayer::FileService,
+            ));
+        }
+        // Defense-in-depth: never mutate anything outside exact-case `_pro/work/<workspace>/**`.
+        for edit in &plan.edits {
+            if !crate::policy::is_pro_work_file_path(&edit.path) {
+                return Err(BridgeError::new(
+                    ErrorCode::BridgePolicyDenied,
+                    format!(
+                        "Work-area edit target '{}' is outside exact-case '_pro/work/<workspace>/**'.",
+                        edit.path
+                    ),
+                    OriginLayer::FileService,
+                ));
+            }
+        }
+        let cur_rid = self.current_root_identity()?;
+        if let Some(ref exp_rid) = plan.root_identity {
+            if exp_rid.starts_with("ntfs:") && *exp_rid != cur_rid {
+                return Err(BridgeError::new(
+                    ErrorCode::StalePrecondition,
+                    "Patch plan root_identity does not match current filesystem root.",
+                    OriginLayer::FileService,
+                ));
+            }
+        }
+
+        let _writer = lock_patch_root(journal_dir, &cur_rid)?;
+        #[cfg(windows)]
+        let (_root_pin, root_path_buf) = {
+            let root_handle = open_patch_directory(&self.root).map_err(patch_io_error)?;
+            let id = file_identity_from_handle(&root_handle)?;
+            if !id.is_directory || id.is_reparse_point || id.canonical_id() != cur_rid {
+                return Err(BridgeError::new(
+                    ErrorCode::StalePrecondition,
+                    "Project root identity changed before applying work edits.",
+                    OriginLayer::FileService,
+                ));
+            }
+            let rp = file_path_from_handle(&root_handle)?;
+            (root_handle, rp)
+        };
+        #[cfg(windows)]
+        let root_path_opt = Some(root_path_buf.as_path());
+        #[cfg(not(windows))]
+        let root_path_opt: Option<&Path> = None;
+
+        // Phase 1: Validate all paths, parents, preimages, and net quota BEFORE writing a single byte.
+        let mut prepared = Vec::with_capacity(plan.edits.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut quota_deltas = BTreeMap::<String, (usize, i128)>::new();
+        let mut missing_dirs = BTreeSet::new();
+
+        for edit in &plan.edits {
+            let (rel, full) = self.resolve_checked(&edit.path, false)?;
+            if !seen.insert(rel.to_ascii_lowercase()) {
+                return Err(BridgeError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("Duplicate target path in patch plan: {rel}"),
+                    OriginLayer::FileService,
+                ));
+            }
+            let folder = crate::policy::delegated_write_quota_scope(&rel, scope)
+                .ok_or_else(|| BridgeError::new(
+                    ErrorCode::BridgePolicyDenied,
+                    "Work-area edit has no authorized folder.",
+                    OriginLayer::FileService,
+                ))?
+                .to_owned();
+            #[cfg(windows)]
+            PatchParent::pin(&self.root, &cur_rid, &rel, true, false, None)?;
+            for parent in full.ancestors().skip(1) {
+                if parent == self.root {
+                    break;
+                }
+                match fs::symlink_metadata(parent) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing_dirs.insert(parent.to_owned());
+                    }
+                    Err(error) => return Err(patch_io_error(error)),
+                }
+            }
+            let target_exists = match fs::symlink_metadata(&full) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(patch_io_error(error)),
+            };
+            let (actual_hash, old_bytes, pre_ntfs_id) = if target_exists {
+                let (bytes, fid) = read_delegated_work_file_verified(
+                    &self.root,
+                    root_path_opt,
+                    &full,
+                    &rel,
+                    DELEGATED_WRITE_MAX_SCOPE_BYTES,
+                )?;
+                (Some(sha256_bytes(&bytes)), Some(bytes), fid)
+            } else {
+                (None, None, None)
+            };
+            match (&edit.expected_hash, &actual_hash) {
+                (None, Some(_)) => {
+                    return Err(BridgeError::new(
+                        ErrorCode::VersionConflict,
+                        format!(
+                            "Target '{rel}' already exists; pass expected_hash of current bytes to overwrite inside _pro/work/."
+                        ),
+                        OriginLayer::FileService,
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(BridgeError::new(
+                        ErrorCode::VersionConflict,
+                        format!("Expected existing file '{rel}' is missing (stale preimage)."),
+                        OriginLayer::FileService,
+                    ));
+                }
+                (Some(exp), Some(act)) if !exp.eq_ignore_ascii_case(act) => {
+                    return Err(BridgeError::new(
+                        ErrorCode::VersionConflict,
+                        format!("Preimage SHA-256 mismatch for '{rel}': expected {exp}, actual {act}."),
+                        OriginLayer::FileService,
+                    ));
+                }
+                _ => {}
+            }
+            let new_bytes = edit.content.as_bytes().to_vec();
+            let post_hash = sha256_bytes(&new_bytes);
+            if let Some(ref exp_post) = edit.expected_postimage_hash {
+                if !exp_post.eq_ignore_ascii_case(&post_hash) {
+                    return Err(BridgeError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("Plan expected_postimage_hash does not match content bytes for '{rel}'."),
+                        OriginLayer::Validation,
+                    ));
+                }
+            }
+            let delta = quota_deltas.entry(folder).or_insert((0, 0));
+            if let Some(ref old) = old_bytes {
+                delta.1 += (new_bytes.len() as i128) - (old.len() as i128);
+            } else {
+                delta.0 += 1;
+                delta.1 += new_bytes.len() as i128;
+            }
+            prepared.push((
+                rel,
+                full,
+                edit.expected_hash.clone(),
+                actual_hash,
+                old_bytes,
+                new_bytes,
+                post_hash,
+                pre_ntfs_id,
+            ));
+        }
+
+        let quota_folders: BTreeMap<&str, (usize, u64)> = quota_deltas
+            .iter()
+            .map(|(folder, (added_files, net_bytes))| {
+                (folder.as_str(), (*added_files, (*net_bytes).max(0) as u64))
+            })
+            .collect();
+        check_delegated_write_quota(&self.root, quota_folders, &missing_dirs)?;
+
+        // Phase 2: Create recovery journal & backups outside target files.
+        let journal_id = format!("pjr_{}", uuid::Uuid::new_v4().simple());
+        let j_root = journal_dir.join(&journal_id);
+        let backups_dir = j_root.join("backups");
+        fs::create_dir(&j_root).map_err(patch_io_error)?;
+        let has_overwrites = prepared.iter().any(|item| item.4.is_some());
+        if has_overwrites {
+            fs::create_dir(&backups_dir).map_err(patch_io_error)?;
+        }
+        let plan_sha = sha256_bytes(serde_json::to_string(plan).unwrap().as_bytes());
+        let mut steps = Vec::with_capacity(prepared.len());
+        for (idx, (rel, _, exp_pre, act_pre, old_bytes, _, post_hash, _)) in prepared.iter().enumerate() {
+            let backup_rel = if let Some(bytes) = old_bytes {
+                let bname = format!("step_{idx:03}.bak");
+                write_synced_new(&backups_dir.join(&bname), bytes)?;
+                Some(format!("backups/{bname}"))
+            } else {
+                None
+            };
+            steps.push(PatchJournalFileStep {
+                path: rel.clone(),
+                expected_preimage: exp_pre.clone(),
+                actual_preimage: act_pre.clone(),
+                backup_rel_path: backup_rel,
+                postimage_sha256: post_hash.clone(),
+                committed: false,
+                deleted: false,
+            });
+        }
+        let mut journal = PatchJournal {
+            journal_id: journal_id.clone(),
+            project_id: plan.project_id.clone(),
+            root_identity: Some(cur_rid.clone()),
+            operation_id: plan.operation_id.clone(),
+            state: "applying".to_string(),
+            plan_sha256: plan_sha,
+            created_at: Utc::now().to_rfc3339(),
+            steps,
+            stage_cleanup_failed: Vec::new(),
+            directory_cleanup_failed: Vec::new(),
+        };
+        let journal_file = j_root.join("journal.json");
+
+        // Phase 3: Stage all files, then commit each with live preimage & grant checks, rolling back on any failure.
+        let mut staged = Vec::with_capacity(prepared.len());
+        let mut created_dirs = Vec::new();
+        let remove_stage: fn(&Path) -> std::io::Result<()> = |path| fs::remove_file(path);
+        let commit_result: Result<(), BridgeError> = (|| {
+            persist_patch_journal(&journal_file, &journal)?;
+            for (idx, (rel, full, _, _, _, bytes, _, _)) in prepared.iter().enumerate() {
+                let temp_name = format!(".eb_stage_{journal_id}_{idx}.tmp");
+                let stage = DelegatedStage::create(&self.root, &cur_rid, rel, full, &temp_name, &mut created_dirs)?;
+                staged.push(stage);
+                staged.last_mut().unwrap().write(rel, bytes)?;
+            }
+            for (idx, stage) in staged.iter_mut().enumerate() {
+                let (rel, _, _, actual_pre, old_bytes, bytes, post_hash, pre_ntfs_id) = &prepared[idx];
+                #[cfg(windows)]
+                stage.parent.verify_location(rel)?;
+                authorize_commit(rel)?;
+                if let Some(old) = old_bytes.as_deref() {
+                    let expected_pre = actual_pre.as_deref().unwrap();
+                    #[cfg(windows)]
+                    {
+                        let preimage_guard = verify_work_preimage_handle(
+                            &stage.parent.root_path,
+                            &stage.destination,
+                            rel,
+                            pre_ntfs_id.as_deref(),
+                            expected_pre,
+                            old.len(),
+                        )?;
+                        stage.parent.verify_location(rel)?;
+                        commit_patch_stage(
+                            stage.file.as_ref().unwrap(),
+                            stage.parent.directories.last().unwrap(),
+                            stage.destination.file_name().unwrap(),
+                            true,
+                        )?;
+                        drop(preimage_guard);
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = (pre_ntfs_id, old);
+                        let (current, _) = read_delegated_work_file_verified(
+                            &self.root,
+                            None,
+                            &stage.destination,
+                            rel,
+                            DELEGATED_WRITE_MAX_SCOPE_BYTES,
+                        )?;
+                        if sha256_bytes(&current) != expected_pre || self.current_root_identity()? != cur_rid {
+                            return Err(patch_commit_conflict(rel));
+                        }
+                        fs::rename(&stage.temp, &stage.destination).map_err(patch_io_error)?;
+                    }
+                } else {
+                    #[cfg(windows)]
+                    {
+                        stage.parent.verify_location(rel)?;
+                        commit_patch_stage(
+                            stage.file.as_ref().unwrap(),
+                            stage.parent.directories.last().unwrap(),
+                            stage.destination.file_name().unwrap(),
+                            false,
+                        )?;
+                    }
+                    #[cfg(not(windows))]
+                    fs::hard_link(&stage.temp, &stage.destination).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            BridgeError::new(
+                                ErrorCode::VersionConflict,
+                                format!("Target '{rel}' already exists; pass expected_hash to overwrite inside _pro/work/."),
+                                OriginLayer::FileService,
+                            )
+                        } else {
+                            patch_io_error(error)
+                        }
+                    })?;
+                }
+                stage.committed = true;
+                journal.steps[idx].committed = true;
+                persist_patch_journal(&journal_file, &journal)?;
+                stage.verify_postimage(rel, bytes.len(), post_hash)?;
+            }
+            journal.state = "committed".into();
+            persist_patch_journal(&journal_file, &journal)?;
+            for stage in &mut staged {
+                stage.close(remove_stage)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(mut error) = commit_result {
+            let mut rollback_failed = Vec::new();
+            for (idx, stage) in staged.iter_mut().enumerate().rev() {
+                if stage.committed {
+                    if let Some(ref old) = prepared[idx].4 {
+                        // Drop our open handle to the newly committed target before replacing it with backup bytes.
+                        stage.file.take();
+                        let restore_ok = (|| -> Result<(), BridgeError> {
+                            #[cfg(windows)]
+                            {
+                                stage.parent.verify_location(&journal.steps[idx].path)?;
+                                let rb_name = format!(".eb_stage_{journal_id}_{idx}_rb.tmp");
+                                let rb_path = stage.parent.path.join(&rb_name);
+                                let res = (|| -> Result<(), BridgeError> {
+                                    let mut rb_file = create_patch_stage(&rb_path).map_err(patch_io_error)?;
+                                    rb_file.write_all(old).map_err(patch_io_error)?;
+                                    rb_file.sync_all().map_err(patch_io_error)?;
+                                    commit_patch_stage(
+                                        &rb_file,
+                                        stage.parent.directories.last().unwrap(),
+                                        stage.destination.file_name().unwrap(),
+                                        true,
+                                    )?;
+                                    Ok(())
+                                })();
+                                if res.is_err() {
+                                    let _ = fs::remove_file(&rb_path);
+                                }
+                                res
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                let rb_path = stage.destination.with_file_name(format!(".eb_stage_{journal_id}_{idx}_rb.tmp"));
+                                let res = (|| -> Result<(), BridgeError> {
+                                    write_synced_new(&rb_path, old)?;
+                                    fs::rename(&rb_path, &stage.destination).map_err(patch_io_error)?;
+                                    Ok(())
+                                })();
+                                if res.is_err() {
+                                    let _ = fs::remove_file(&rb_path);
+                                }
+                                res
+                            }
+                        })().is_ok();
+                        if restore_ok {
+                            journal.steps[idx].committed = false;
+                        } else {
+                            rollback_failed.push(journal.steps[idx].path.clone());
+                        }
+                    } else if stage.undo_commit().is_ok() {
+                        journal.steps[idx].committed = false;
+                    } else {
+                        rollback_failed.push(journal.steps[idx].path.clone());
+                    }
+                }
+                if stage.close(remove_stage).is_err() {
+                    let relative = Path::new(&journal.steps[idx].path).with_file_name(stage.temp.file_name().unwrap());
+                    journal.stage_cleanup_failed.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            drop(staged);
+            for relative in created_dirs.iter().rev() {
+                match fs::remove_dir(self.root.join(relative)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => journal.directory_cleanup_failed.push(relative.to_string_lossy().replace('\\', "/")),
+                }
+            }
+            let residue = !rollback_failed.is_empty()
+                || !journal.stage_cleanup_failed.is_empty()
+                || !journal.directory_cleanup_failed.is_empty();
+            let journal_update_failed = if residue {
+                journal.state = "rollback_incomplete".into();
+                persist_patch_journal(&journal_file, &journal).is_err()
+            } else {
+                fs::remove_dir_all(&j_root).is_err()
+            };
+            if residue || journal_update_failed {
+                let mut details = serde_json::json!({
+                    "original_details": error.details,
+                    "rollback_failed": rollback_failed,
+                    "stage_cleanup_failed": journal.stage_cleanup_failed,
+                    "directory_cleanup_failed": journal.directory_cleanup_failed,
+                    "journal_update_failed": journal_update_failed,
+                });
+                if journal_file.is_file() {
+                    details["journal_id"] = serde_json::json!(journal_id);
+                }
+                error.details = Some(details);
+            }
+            return Err(error);
+        }
+
+        let mut diff_out = String::new();
+        let mut post_hashes = BTreeMap::new();
+        let mut applied_files = Vec::with_capacity(prepared.len());
+        for (rel, _, _, _, old_bytes, new_bytes, expected_post, _) in prepared {
+            let old_text = old_bytes
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
+            let diff = TextDiff::from_lines(&old_text, &new_text);
+            diff_out.push_str(&format!(
+                "{}",
+                diff.unified_diff()
+                    .context_radius(3)
+                    .header(&format!("a/{rel}"), &format!("b/{rel}"))
+            ));
+            post_hashes.insert(rel.clone(), expected_post);
+            applied_files.push(rel);
+        }
+        let diff_sha = sha256_bytes(diff_out.as_bytes());
+        Ok((
+            PatchApplyResult {
+                journal_id,
+                operation_id: plan.operation_id.clone(),
+                files_applied: applied_files,
+                postimage_hashes: post_hashes,
+                unified_diff: diff_out,
+                diff_sha256: diff_sha,
+            },
+            journal,
+        ))
     }
 
     fn apply_patch_plan_inner(
@@ -1504,6 +2323,7 @@ impl ScopedFiles {
                 backup_rel_path: backup_rel,
                 postimage_sha256: post_hash.clone(),
                 committed: false,
+                deleted: false,
             });
         }
         let mut journal = PatchJournal {
@@ -1764,6 +2584,40 @@ impl ScopedFiles {
                 continue;
             }
             let (_, full) = self.resolve_checked(&step.path, false)?;
+            let expected_backup = format!("backups/step_{idx:03}.bak");
+            if step.deleted {
+                let (hash, bytes) = match (&step.actual_preimage, &step.backup_rel_path) {
+                    (Some(hash), Some(rel)) if rel == &expected_backup => {
+                        let (_, path) = journal_files.resolve_checked(&format!("{journal_id}/{expected_backup}"), true)?;
+                        let (bytes, _) = read_handle_verified(&path, &expected_backup)?;
+                        if sha256_bytes(&bytes) != *hash {
+                            return Err(invalid_rollback_backup(&step.path));
+                        }
+                        (hash, bytes)
+                    }
+                    _ => return Err(invalid_rollback_backup(&step.path)),
+                };
+                match fs::symlink_metadata(&full) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        verified_steps.push((step, full, None, Some(bytes)));
+                    }
+                    Ok(_) => {
+                        let (current, _) = read_handle_verified(&full, &step.path)?;
+                        if sha256_bytes(&current) == *hash {
+                            continue; // A previous rollback already restored this file.
+                        }
+                        return Err(rollback_target_conflict(&step.path));
+                    }
+                    Err(e) => {
+                        return Err(BridgeError::new(
+                            ErrorCode::InternalError,
+                            format!("Cannot inspect rollback target: {e}"),
+                            OriginLayer::FileService,
+                        ));
+                    }
+                }
+                continue;
+            }
             if !full.try_exists().map_err(|e| BridgeError::new(
                 ErrorCode::InternalError, format!("Cannot inspect rollback target: {e}"), OriginLayer::FileService,
             ))? {
@@ -1780,7 +2634,6 @@ impl ScopedFiles {
             if current_hash != step.postimage_sha256 {
                 return Err(rollback_target_conflict(&step.path));
             }
-            let expected_backup = format!("backups/step_{idx:03}.bak");
             let backup = match (&step.actual_preimage, &step.backup_rel_path) {
                 (None, None) => None,
                 (Some(hash), Some(rel)) if rel == &expected_backup => {
@@ -1798,6 +2651,65 @@ impl ScopedFiles {
 
         let mut restored = Vec::new();
         for (step, full, expected_fid, backup) in verified_steps.into_iter().rev() {
+            if step.deleted {
+                if self.current_root_identity()? != root_identity {
+                    return Err(rollback_target_conflict(&step.path));
+                }
+                self.resolve_checked(&step.path, false)?;
+                match fs::symlink_metadata(&full) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(rollback_target_conflict(&step.path)),
+                    Err(e) => {
+                        return Err(BridgeError::new(
+                            ErrorCode::InternalError,
+                            format!("Cannot inspect rollback target: {e}"),
+                            OriginLayer::FileService,
+                        ));
+                    }
+                }
+                let backup_bytes = backup.ok_or_else(|| invalid_rollback_backup(&step.path))?;
+                #[cfg(windows)]
+                {
+                    let parent = PatchParent::pin(&self.root, &root_identity, &step.path, false, true, None)?;
+                    let file_name = full.file_name().ok_or_else(|| rollback_target_conflict(&step.path))?;
+                    let tmp = parent.path.join(format!(".eb_rb_{}.tmp", uuid::Uuid::new_v4().simple()));
+                    let res = (|| -> Result<(), BridgeError> {
+                        let mut f = create_patch_stage(&tmp).map_err(patch_io_error)?;
+                        f.write_all(&backup_bytes).map_err(patch_io_error)?;
+                        f.sync_all().map_err(patch_io_error)?;
+                        parent.verify_location(&step.path)?;
+                        commit_patch_stage(&f, parent.directories.last().unwrap(), file_name, false).map_err(|err| {
+                            if err.code == ErrorCode::VersionConflict {
+                                rollback_target_conflict(&step.path)
+                            } else {
+                                err
+                            }
+                        })?;
+                        Ok(())
+                    })();
+                    if res.is_err() {
+                        let _ = fs::remove_file(&tmp);
+                    }
+                    res?;
+                }
+                #[cfg(not(windows))]
+                {
+                    if let Some(parent_dir) = full.parent() {
+                        fs::create_dir_all(parent_dir).map_err(patch_io_error)?;
+                    }
+                    let tmp = full.with_file_name(format!(".eb_rb_{}.tmp", uuid::Uuid::new_v4().simple()));
+                    let res = (|| -> Result<(), BridgeError> {
+                        write_synced_new(&tmp, &backup_bytes)?;
+                        commit_new_patch_file(&tmp, &full)
+                    })();
+                    if res.is_err() {
+                        let _ = fs::remove_file(&tmp);
+                    }
+                    res?;
+                }
+                restored.push(step.path.clone());
+                continue;
+            }
             let verify_target = || {
                 if self.current_root_identity()? != root_identity {
                     return Err(rollback_target_conflict(&step.path));
@@ -1848,13 +2760,13 @@ impl ScopedFiles {
     }
 }
 
-fn write_synced_new(path: &Path, data: &[u8]) -> Result<(), BridgeError> {
+pub(crate) fn write_synced_new(path: &Path, data: &[u8]) -> Result<(), BridgeError> {
     let mut file = File::create_new(path).map_err(patch_io_error)?;
     file.write_all(data).map_err(patch_io_error)?;
     file.sync_all().map_err(patch_io_error)
 }
 
-fn persist_patch_journal(path: &Path, journal: &PatchJournal) -> Result<(), BridgeError> {
+pub(crate) fn persist_patch_journal(path: &Path, journal: &PatchJournal) -> Result<(), BridgeError> {
     let staged = path.with_file_name(format!("journal-{}.tmp", uuid::Uuid::new_v4().simple()));
     let data = serde_json::to_vec_pretty(journal).map_err(|error| {
         BridgeError::new(ErrorCode::InternalError, format!("Patch journal serialization failed: {error}"), OriginLayer::FileService)
@@ -1899,7 +2811,218 @@ fn verify_patch_preimage(path: &Path, relative: &str, expected_id: Option<&str>,
     Ok(file)
 }
 
-fn lock_patch_root(journal_dir: &Path, root_identity: &str) -> Result<File, BridgeError> {
+/// Open an existing delegated work-area target for commit-time preimage verification without following
+/// reparse points, verifying exact casing, single-link identity (`n_links == 1`), and SHA-256 while
+/// holding the handle open across replacement.
+#[cfg(windows)]
+pub(crate) fn verify_work_preimage_handle(
+    root_path: &Path,
+    path: &Path,
+    relative: &str,
+    expected_id: Option<&str>,
+    expected_hash: &str,
+    expected_size: usize,
+) -> Result<File, BridgeError> {
+    let mut file = match open_patch_preimage(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(patch_commit_conflict(relative));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Opening a directory or NTFS junction without BACKUP_SEMANTICS fails with AccessDenied.
+            if let Ok(meta_handle) = bridge_platform::windows::open_path_metadata_no_follow(path) {
+                if let Ok(meta_id) = file_identity_from_handle(&meta_handle) {
+                    if meta_id.is_reparse_point || meta_id.is_directory {
+                        return Err(BridgeError::new(
+                            ErrorCode::UnsupportedPathType,
+                            format!("Target '{relative}' is a reparse point or directory and cannot be overwritten."),
+                            OriginLayer::FileService,
+                        ));
+                    }
+                }
+            }
+            return Err(patch_io_error(error));
+        }
+        Err(error) => return Err(patch_io_error(error)),
+    };
+    let identity = file_identity_from_handle(&file)?;
+    if identity.is_directory || identity.is_reparse_point || identity.n_links != 1 {
+        return Err(BridgeError::new(
+            ErrorCode::UnsupportedPathType,
+            format!("Target '{relative}' is not a regular single-link non-reparse file."),
+            OriginLayer::FileService,
+        ));
+    }
+    verify_opened_name(root_path, Path::new(relative), &file_path_from_handle(&file)?)?;
+    if expected_id.is_some() && Some(identity.canonical_id().as_str()) != expected_id
+        || identity.size_bytes != expected_size as u64
+    {
+        return Err(patch_commit_conflict(relative));
+    }
+    let mut content = Vec::with_capacity(expected_size);
+    (&mut file)
+        .take((expected_size as u64).saturating_add(1))
+        .read_to_end(&mut content)
+        .map_err(patch_io_error)?;
+    if content.len() != expected_size
+        || sha256_bytes(&content) != expected_hash
+        || file_identity_no_follow_named(path, relative)?.canonical_id() != identity.canonical_id()
+    {
+        return Err(patch_commit_conflict(relative));
+    }
+    Ok(file)
+}
+
+/// Read an existing delegated work-area or remote-source file strictly through a no-follow handle,
+/// refusing reparse points, directories, and multi-link files (`n_links != 1`) with `UnsupportedPathType`,
+/// and refusing exact-casing / hidden mismatches with `BridgePolicyDenied`.
+pub(crate) fn read_delegated_work_file_verified(
+    _root: &Path,
+    root_path_opt: Option<&Path>,
+    full: &Path,
+    relative: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Option<String>), BridgeError> {
+    #[cfg(windows)]
+    let (mut file, canonical) = {
+        let pre = match bridge_platform::windows::open_path_metadata_no_follow(full) {
+            Ok(meta_handle) => file_identity_from_handle(&meta_handle)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BridgeError::new(
+                    ErrorCode::FileNotFound,
+                    format!("File not found: {relative}"),
+                    OriginLayer::FileService,
+                ));
+            }
+            Err(error) => return Err(patch_io_error(error)),
+        };
+        if pre.is_reparse_point || pre.is_directory || pre.n_links != 1 {
+            return Err(BridgeError::new(
+                ErrorCode::UnsupportedPathType,
+                format!("Target '{relative}' must be a regular single-link non-reparse file."),
+                OriginLayer::FileService,
+            ));
+        }
+        let file = open_read_no_follow(full).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BridgeError::new(
+                    ErrorCode::FileNotFound,
+                    format!("File not found: {relative}"),
+                    OriginLayer::FileService,
+                )
+            } else {
+                patch_io_error(error)
+            }
+        })?;
+        let open_id = file_identity_from_handle(&file)?;
+        if open_id.is_reparse_point || open_id.is_directory || open_id.n_links != 1 {
+            return Err(BridgeError::new(
+                ErrorCode::UnsupportedPathType,
+                format!("Target '{relative}' must be a regular single-link non-reparse file."),
+                OriginLayer::FileService,
+            ));
+        }
+        if open_id.canonical_id() != pre.canonical_id() {
+            return Err(BridgeError::new(
+                ErrorCode::StalePrecondition,
+                "File identity changed concurrently between path check and handle open.",
+                OriginLayer::FileService,
+            ));
+        }
+        if let Some(root_path) = root_path_opt {
+            verify_opened_name(root_path, Path::new(relative), &file_path_from_handle(&file)?)?;
+        }
+        if open_id.size_bytes > max_bytes {
+            return Err(BridgeError::new(
+                ErrorCode::ResourceBudgetExceeded,
+                format!("File '{relative}' exceeds size limit of {max_bytes} bytes."),
+                OriginLayer::FileService,
+            ));
+        }
+        (file, Some(open_id.canonical_id()))
+    };
+    #[cfg(not(windows))]
+    let (mut file, canonical) = {
+        let _ = root_path_opt;
+        let meta = fs::symlink_metadata(full).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BridgeError::new(
+                    ErrorCode::FileNotFound,
+                    format!("File not found: {relative}"),
+                    OriginLayer::FileService,
+                )
+            } else {
+                patch_io_error(error)
+            }
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(BridgeError::new(
+                ErrorCode::UnsupportedPathType,
+                format!("Target '{relative}' must be a regular single-link non-reparse file."),
+                OriginLayer::FileService,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() != 1 {
+                return Err(BridgeError::new(
+                    ErrorCode::UnsupportedPathType,
+                    format!("Target '{relative}' must be a regular single-link non-reparse file."),
+                    OriginLayer::FileService,
+                ));
+            }
+        }
+        if meta.len() > max_bytes {
+            return Err(BridgeError::new(
+                ErrorCode::ResourceBudgetExceeded,
+                format!("File '{relative}' exceeds size limit of {max_bytes} bytes."),
+                OriginLayer::FileService,
+            ));
+        }
+        let file = File::open(full).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BridgeError::new(
+                    ErrorCode::FileNotFound,
+                    format!("File not found: {relative}"),
+                    OriginLayer::FileService,
+                )
+            } else {
+                patch_io_error(error)
+            }
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let opened = file.metadata().map_err(patch_io_error)?;
+            if opened.dev() != meta.dev() || opened.ino() != meta.ino() || opened.nlink() != 1 {
+                return Err(BridgeError::new(
+                    ErrorCode::UnsupportedPathType,
+                    format!("Target '{relative}' changed or has multiple links."),
+                    OriginLayer::FileService,
+                ));
+            }
+        }
+        (file, None::<String>)
+    };
+
+    let expected = file.metadata().map(|m| m.len()).unwrap_or(0).min(max_bytes.saturating_add(1));
+    let mut raw = Vec::with_capacity(expected as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(patch_io_error)?;
+    if raw.len() as u64 > max_bytes {
+        return Err(BridgeError::new(
+            ErrorCode::ResourceBudgetExceeded,
+            format!("File '{relative}' exceeds size limit of {max_bytes} bytes."),
+            OriginLayer::FileService,
+        ));
+    }
+    Ok((raw, canonical))
+}
+
+pub(crate) fn lock_patch_root(journal_dir: &Path, root_identity: &str) -> Result<File, BridgeError> {
     // Every CLI/HTTP patch and recovery operation sharing a state directory
     // takes the same OS lock before validating any file in this root.
     let directory = journal_dir.join("root-locks");
@@ -1933,11 +3056,11 @@ fn lock_patch_root(journal_dir: &Path, root_identity: &str) -> Result<File, Brid
     }
 }
 
-fn patch_io_error(error: std::io::Error) -> BridgeError {
+pub(crate) fn patch_io_error(error: std::io::Error) -> BridgeError {
     BridgeError::new(ErrorCode::InternalError, format!("Patch I/O failed: {error}"), OriginLayer::FileService)
 }
 
-fn patch_commit_conflict(path: &str) -> BridgeError {
+pub(crate) fn patch_commit_conflict(path: &str) -> BridgeError {
     BridgeError::new(ErrorCode::VersionConflict, format!("Patch target '{path}' changed before commit."), OriginLayer::FileService)
 }
 
@@ -2638,5 +3761,478 @@ mod tests {
         assert_eq!(conflict_err.code, ErrorCode::VersionConflict);
         assert_eq!(conflict_err.next_action, DELEGATED_CREATE_ONLY_NEXT_ACTION);
         assert_eq!(fs::read(root.join("_pro/reports/raced.md")).unwrap(), b"created before commit");
+    }
+
+    #[test]
+    fn read_with_options_line_ranges_lf_crlf_utf8_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("lf.txt"), "line1\nline2\nline3\nline4\n").unwrap();
+        fs::write(root.join("crlf.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+        fs::write(root.join("utf8.txt"), "héllo\n世界\n😀end").unwrap();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        let long_content: String = (1..=2005).map(|i| format!("L{i}\n")).collect();
+        fs::write(root.join("long.txt"), &long_content).unwrap();
+
+        let sf = ScopedFiles::new(root, None).unwrap();
+
+        // Standard offset read omits optional line fields in JSON.
+        let plain = sf.read("lf.txt", 0, 1024, false).unwrap();
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert!(plain_json.get("total_lines").is_none());
+        assert!(plain_json.get("start_line").is_none());
+        assert!(plain_json.get("end_line").is_none());
+
+        // LF line range preserves full-file hash and reports exact char offset and line bounds.
+        let lf = sf.read_with_options("lf.txt", 0, 1024, false, Some(2), Some(3)).unwrap();
+        assert_eq!(lf.content, "line2\nline3\n");
+        assert_eq!(lf.offset, 6);
+        assert_eq!(lf.next_offset, None);
+        assert!(!lf.truncated);
+        assert_eq!(lf.line_ending, "LF");
+        assert_eq!(lf.hash, plain.hash);
+        assert_eq!(lf.page_hash, sha256_bytes(b"line2\nline3\n"));
+        assert_eq!(lf.total_lines, Some(4));
+        assert_eq!(lf.start_line, Some(2));
+        assert_eq!(lf.end_line, Some(3));
+
+        // CRLF line range preserves \r\n.
+        let crlf = sf.read_with_options("crlf.txt", 0, 1024, false, Some(2), Some(2)).unwrap();
+        assert_eq!(crlf.content, "two\r\n");
+        assert_eq!(crlf.offset, 5);
+        assert_eq!(crlf.line_ending, "CRLF");
+        assert_eq!(crlf.total_lines, Some(3));
+        assert_eq!(crlf.start_line, Some(2));
+        assert_eq!(crlf.end_line, Some(2));
+
+        // UTF-8 multibyte chars count characters for offset and preserve exact bytes.
+        let utf8 = sf.read_with_options("utf8.txt", 0, 1024, false, Some(2), Some(3)).unwrap();
+        assert_eq!(utf8.content, "世界\n😀end");
+        assert_eq!(utf8.offset, "héllo\n".chars().count());
+        assert_eq!(utf8.total_lines, Some(3));
+        assert_eq!(utf8.start_line, Some(2));
+        assert_eq!(utf8.end_line, Some(3));
+
+        // end_line only starts at line 1; start_line past EOF returns empty slice; empty file has 0 lines.
+        let head = sf.read_with_options("lf.txt", 0, 1024, false, None, Some(2)).unwrap();
+        assert_eq!(head.content, "line1\nline2\n");
+        assert_eq!((head.start_line, head.end_line, head.total_lines), (Some(1), Some(2), Some(4)));
+
+        let past = sf.read_with_options("lf.txt", 0, 1024, false, Some(10), Some(20)).unwrap();
+        assert_eq!(past.content, "");
+        assert_eq!((past.start_line, past.end_line, past.total_lines), (None, None, Some(4)));
+
+        let empty = sf.read_with_options("empty.txt", 0, 1024, false, Some(1), Some(5)).unwrap();
+        assert_eq!(empty.content, "");
+        assert_eq!((empty.start_line, empty.end_line, empty.total_lines), (None, None, Some(0)));
+
+        // Character limit truncation inside line range sets truncated and next_offset cleanly.
+        let trunc = sf.read_with_options("lf.txt", 0, 8, false, Some(2), Some(4)).unwrap();
+        assert_eq!(trunc.content, "line2\nli");
+        assert_eq!(trunc.offset, 6);
+        assert!(trunc.truncated);
+        assert_eq!(trunc.next_offset, Some(14));
+        assert_eq!((trunc.start_line, trunc.end_line), (Some(2), Some(3)));
+
+        // Open-ended start_line caps at MAX_READ_LINES (2000) and reports truncated.
+        let capped = sf.read_with_options("long.txt", 0, MAX_PAGE_BYTES, false, Some(1), None).unwrap();
+        assert!(capped.truncated);
+        assert!(capped.next_offset.is_some());
+        assert_eq!(capped.total_lines, Some(2005));
+        assert_eq!(capped.start_line, Some(1));
+        assert_eq!(capped.end_line, Some(MAX_READ_LINES));
+
+        // Exact boundary 1..=2000 succeeds; 1..=2001 fails.
+        assert!(sf.read_with_options("long.txt", 0, MAX_PAGE_BYTES, false, Some(1), Some(2000)).is_ok());
+
+        // Batch read mixes line ranges and character offsets in one call.
+        let batch = sf.read_batch(&[
+            BatchReadItemRequest {
+                path: "lf.txt".into(),
+                offset: 0,
+                limit: 1024,
+                lossy_utf8: false,
+                start_line: Some(2),
+                end_line: Some(2),
+            },
+            BatchReadItemRequest {
+                path: "crlf.txt".into(),
+                offset: 5,
+                limit: 5,
+                lossy_utf8: false,
+                start_line: None,
+                end_line: None,
+            },
+        ]).unwrap();
+        assert!(batch[0].ok);
+        assert_eq!(batch[0].result.as_ref().unwrap().content, "line2\n");
+        assert_eq!(batch[0].result.as_ref().unwrap().start_line, Some(2));
+        assert!(batch[1].ok);
+        assert_eq!(batch[1].result.as_ref().unwrap().content, "two\r\n");
+        assert_eq!(batch[1].result.as_ref().unwrap().start_line, None);
+
+        // Negative validation cases.
+        for (offset, s, e) in [
+            (0, Some(0), Some(1)),
+            (0, Some(1), Some(0)),
+            (0, Some(3), Some(2)),
+            (0, Some(1), Some(2001)),
+            (1, Some(1), Some(2)),
+            (5, None, Some(2)),
+        ] {
+            let err = sf.read_with_options("lf.txt", offset, 1024, false, s, e).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "offset={offset} s={s:?} e={e:?}");
+        }
+    }
+
+    #[test]
+    fn search_with_options_context_glob_regex_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let long_ctx = "x".repeat(300);
+        fs::write(
+            root.join("src/app.py"),
+            format!("l1\n{long_ctx}\ndef compute_42():\n    return 42\nl5\n"),
+        ).unwrap();
+        fs::write(root.join("src/readme.md"), "def compute_42(): docs\n").unwrap();
+
+        let sf = ScopedFiles::new(root, None).unwrap();
+
+        // Context lines + file_glob + regex.
+        let hits = sf
+            .search_with_options(".", r"def\s+compute_\d+", 10, true, false, 2, Some("*.py"), true)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/app.py");
+        assert_eq!(hits[0].line, 3);
+        assert_eq!(hits[0].preview, "def compute_42():");
+        assert_eq!(hits[0].context_before.len(), 2);
+        assert_eq!(hits[0].context_before[0], "l1");
+        assert_eq!(hits[0].context_before[1].chars().count(), 240);
+        assert_eq!(hits[0].context_after, vec!["    return 42", "l5"]);
+
+        // Case sensitivity with regex.
+        assert!(sf.search_with_options(".", "DEF\\s+COMPUTE", 10, true, true, 0, Some("*.py"), true).unwrap().is_empty());
+        assert_eq!(sf.search_with_options(".", "DEF\\s+COMPUTE", 10, true, false, 0, Some("*.py"), true).unwrap().len(), 1);
+
+        // context_lines == 0 omits context fields from JSON.
+        let plain_hits = sf.search("src/app.py", "compute_42", 10, true, false).unwrap();
+        let hit_json = serde_json::to_value(&plain_hits[0]).unwrap();
+        assert!(hit_json.get("context_before").is_none());
+        assert!(hit_json.get("context_after").is_none());
+
+        // Single-file search respects file_glob.
+        assert!(sf.search_with_options("src/app.py", "compute_42", 10, true, false, 0, Some("*.rs"), false).unwrap().is_empty());
+
+        // Validation failures.
+        assert_eq!(
+            sf.search_with_options(".", "compute", 10, true, false, 6, None, false).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            sf.search_with_options(".", "[unclosed", 10, true, false, 0, None, true).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            sf.search_with_options(".", "a{50000}", 10, true, false, 0, None, true).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let too_long = "a".repeat(MAX_FILE_GLOB_BYTES + 1);
+        for bad_glob in ["", too_long.as_str(), "src/*.py", r"src\*.py", "..*.py", "a:b", "é*.py"] {
+            let err = sf.search_with_options(".", "compute", 10, true, false, 0, Some(bad_glob), false).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "glob={bad_glob}");
+        }
+    }
+
+    #[test]
+    fn list_with_max_limit_supports_500_while_list_stays_capped_at_100() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..250 {
+            fs::write(dir.path().join(format!("f_{i:03}.txt")), "x").unwrap();
+        }
+        let sf = ScopedFiles::new(dir.path(), None).unwrap();
+        let (capped, next) = sf.list(".", false, 1, true, 0, 250).unwrap();
+        assert_eq!(capped.len(), 100);
+        assert_eq!(next, Some(100));
+
+        let (wide, next_wide) = sf.list_with_max_limit(".", false, 1, true, 0, 250, 500).unwrap();
+        assert_eq!(wide.len(), 250);
+        assert_eq!(next_wide, None);
+    }
+
+    #[test]
+    fn remote_read_options_enforce_hidden_traversal_junction_shortname_and_case_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("src/App.py"), "SECRET_TOKEN_XYZ=visible\n").unwrap();
+        fs::write(root.join(".env"), "SECRET_TOKEN_XYZ=hidden_env\n").unwrap();
+        fs::write(root.join(".git/config"), "SECRET_TOKEN_XYZ=hidden_git\n").unwrap();
+        fs::write(root.join("auth.json"), "{\"tok\":\"SECRET_TOKEN_XYZ\"}\n").unwrap();
+        fs::write(outside.join("leak.py"), "SECRET_TOKEN_XYZ=outside\n").unwrap();
+
+        let link = root.join("src").join("linked");
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let remote = ScopedFiles::new_remote_read(&root, None).unwrap();
+
+        // Regex search never surfaces hidden files or junction targets.
+        let hits = remote
+            .search_with_options(".", "SECRET_TOKEN_.*", 50, false, false, 1, None, true)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/App.py");
+
+        // Hidden files refused with BridgePolicyDenied even with start_line.
+        for secret in [".env", ".git/config", "auth.json"] {
+            assert_eq!(
+                remote.read_with_options(secret, 0, 1024, false, Some(1), Some(1)).unwrap_err().code,
+                ErrorCode::BridgePolicyDenied,
+                "{secret}"
+            );
+        }
+
+        // Traversal refused with PathOutsideRoot.
+        assert_eq!(
+            remote.read_with_options("../outside/leak.py", 0, 1024, false, Some(1), Some(1)).unwrap_err().code,
+            ErrorCode::PathOutsideRoot
+        );
+
+        // Junction parent and target refused with UnsupportedPathType.
+        assert_eq!(
+            remote.read_with_options("src/linked/leak.py", 0, 1024, false, Some(1), Some(1)).unwrap_err().code,
+            ErrorCode::UnsupportedPathType
+        );
+        assert_eq!(
+            remote.search_with_options("src/linked", "SECRET", 10, false, false, 0, None, true).unwrap_err().code,
+            ErrorCode::UnsupportedPathType
+        );
+
+        // Short name component refused with BridgePolicyDenied.
+        assert_eq!(
+            remote.read_with_options("SRC~1/App.py", 0, 1024, false, Some(1), Some(1)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+
+        // Case mismatch on Windows NTFS refused with BridgePolicyDenied.
+        #[cfg(windows)]
+        assert_eq!(
+            remote.read_with_options("Src/App.py", 0, 1024, false, Some(1), Some(1)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+
+        #[cfg(windows)]
+        fs::remove_dir(link).unwrap();
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+    }
+
+    #[test]
+    fn apply_delegated_work_edits_enforces_work_scope_net_quota_hardlinks_and_overwrite_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let journals = dir.path().join("journals");
+        fs::create_dir_all(root.join("_pro/work/w1")).unwrap();
+        fs::create_dir_all(root.join("_pro/outbox")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(&journals).unwrap();
+
+        fs::write(root.join("src/live.py"), "LIVE_DATA\n").unwrap();
+        fs::write(root.join("_pro/work/w1/a.py"), "alpha\n").unwrap();
+        fs::write(root.join("_pro/work/w1/b.py"), "beta\n").unwrap();
+        fs::write(root.join("_pro/outbox/msg.md"), "outbox\n").unwrap();
+
+        let sf = ScopedFiles::new(&root, None).unwrap();
+        let scope = vec!["_pro/**".to_string()];
+
+        // 1. Defense-in-depth refuses anything outside exact-case `_pro/work/<workspace>/**`.
+        for bad_path in [
+            "_pro/outbox/msg.md",
+            "_pro/reports/r.md",
+            "_pro/inbox/req.md",
+            "_PRO/work/w1/a.py",
+            "_pro/Work/w1/a.py",
+            "src/live.py",
+        ] {
+            let plan = PatchPlanV04 {
+                patch_plan_version: "0.4.0".into(),
+                project_id: "proj_1".into(),
+                root_identity: None,
+                operation_id: "op_bad_scope".into(),
+                task_id: None,
+                summary: None,
+                baseline_manifest_sha256: None,
+                scope: vec![bad_path.into()],
+                edits: vec![PatchEditV04 {
+                    path: bad_path.into(),
+                    content: "changed\n".into(),
+                    expected_hash: None,
+                    expected_postimage_hash: None,
+                }],
+                verification_recipe: None,
+                verification_command: None,
+            };
+            assert_eq!(
+                sf.apply_delegated_work_edits(&plan, &journals, &scope, |_| Ok(())).unwrap_err().code,
+                ErrorCode::BridgePolicyDenied,
+                "{bad_path}"
+            );
+        }
+
+        // 2. Hardlink inside workspace to live project file is refused without altering live.py.
+        let hl = root.join("_pro/work/w1/hard.py");
+        fs::hard_link(root.join("src/live.py"), &hl).unwrap();
+        let hl_plan = PatchPlanV04 {
+            patch_plan_version: "0.4.0".into(),
+            project_id: "proj_1".into(),
+            root_identity: None,
+            operation_id: "op_hl".into(),
+            task_id: None,
+            summary: None,
+            baseline_manifest_sha256: None,
+            scope: vec!["_pro/work/w1/hard.py".into()],
+            edits: vec![PatchEditV04 {
+                path: "_pro/work/w1/hard.py".into(),
+                content: "HACKED\n".into(),
+                expected_hash: Some(sha256_bytes(b"LIVE_DATA\n")),
+                expected_postimage_hash: None,
+            }],
+            verification_recipe: None,
+            verification_command: None,
+        };
+        assert_eq!(
+            sf.apply_delegated_work_edits(&hl_plan, &journals, &scope, |_| Ok(())).unwrap_err().code,
+            ErrorCode::UnsupportedPathType
+        );
+        assert_eq!(fs::read_to_string(root.join("src/live.py")).unwrap(), "LIVE_DATA\n");
+        fs::remove_file(&hl).unwrap();
+
+        // 3. Overwrite without expected_hash fails VersionConflict; with matching expected_hash rolls back step 0 when step 1 fails at commit.
+        let no_hash_plan = PatchPlanV04 {
+            patch_plan_version: "0.4.0".into(),
+            project_id: "proj_1".into(),
+            root_identity: None,
+            operation_id: "op_nohash".into(),
+            task_id: None,
+            summary: None,
+            baseline_manifest_sha256: None,
+            scope: vec!["_pro/work/w1/a.py".into()],
+            edits: vec![PatchEditV04 {
+                path: "_pro/work/w1/a.py".into(),
+                content: "new\n".into(),
+                expected_hash: None,
+                expected_postimage_hash: None,
+            }],
+            verification_recipe: None,
+            verification_command: None,
+        };
+        assert_eq!(
+            sf.apply_delegated_work_edits(&no_hash_plan, &journals, &scope, |_| Ok(())).unwrap_err().code,
+            ErrorCode::VersionConflict
+        );
+
+        let multi_plan = PatchPlanV04 {
+            patch_plan_version: "0.4.0".into(),
+            project_id: "proj_1".into(),
+            root_identity: None,
+            operation_id: "op_rollback_ow".into(),
+            task_id: None,
+            summary: None,
+            baseline_manifest_sha256: None,
+            scope: vec!["_pro/work/w1/a.py".into(), "_pro/work/w1/b.py".into()],
+            edits: vec![
+                PatchEditV04 {
+                    path: "_pro/work/w1/a.py".into(),
+                    content: "alpha_new\n".into(),
+                    expected_hash: Some(sha256_bytes(b"alpha\n")),
+                    expected_postimage_hash: None,
+                },
+                PatchEditV04 {
+                    path: "_pro/work/w1/b.py".into(),
+                    content: "beta_new\n".into(),
+                    expected_hash: Some(sha256_bytes(b"beta\n")),
+                    expected_postimage_hash: None,
+                },
+            ],
+            verification_recipe: None,
+            verification_command: None,
+        };
+        let err = sf.apply_delegated_work_edits(&multi_plan, &journals, &scope, |path| {
+            if path.ends_with("b.py") {
+                Err(BridgeError::new(ErrorCode::BridgePolicyDenied, "revoked", OriginLayer::Policy))
+            } else {
+                Ok(())
+            }
+        }).unwrap_err();
+        assert_eq!(err.code, ErrorCode::BridgePolicyDenied);
+        assert_eq!(fs::read_to_string(root.join("_pro/work/w1/a.py")).unwrap(), "alpha\n");
+        assert_eq!(fs::read_to_string(root.join("_pro/work/w1/b.py")).unwrap(), "beta\n");
+
+        // 4. Net positive quota delta: overwriting an existing file at the 256 MiB boundary succeeds when size does not grow,
+        //    and fails ResourceBudgetExceeded when size grows by 1 byte.
+        let used_so_far = measure_delegated_folder_quota(&root, "_pro").unwrap().bytes;
+        File::create(root.join("_pro/outbox/filler.bin"))
+            .unwrap()
+            .set_len(DELEGATED_WRITE_MAX_SCOPE_BYTES - used_so_far)
+            .unwrap();
+        let same_size_plan = PatchPlanV04 {
+            patch_plan_version: "0.4.0".into(),
+            project_id: "proj_1".into(),
+            root_identity: None,
+            operation_id: "op_same_size".into(),
+            task_id: None,
+            summary: None,
+            baseline_manifest_sha256: None,
+            scope: vec!["_pro/work/w1/a.py".into()],
+            edits: vec![PatchEditV04 {
+                path: "_pro/work/w1/a.py".into(),
+                content: "ALPHA\n".into(),
+                expected_hash: Some(sha256_bytes(b"alpha\n")),
+                expected_postimage_hash: None,
+            }],
+            verification_recipe: None,
+            verification_command: None,
+        };
+        sf.apply_delegated_work_edits(&same_size_plan, &journals, &scope, |_| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(root.join("_pro/work/w1/a.py")).unwrap(), "ALPHA\n");
+
+        let grow_plan = PatchPlanV04 {
+            patch_plan_version: "0.4.0".into(),
+            project_id: "proj_1".into(),
+            root_identity: None,
+            operation_id: "op_grow".into(),
+            task_id: None,
+            summary: None,
+            baseline_manifest_sha256: None,
+            scope: vec!["_pro/work/w1/a.py".into()],
+            edits: vec![PatchEditV04 {
+                path: "_pro/work/w1/a.py".into(),
+                content: "ALPHA!\n".into(),
+                expected_hash: Some(sha256_bytes(b"ALPHA\n")),
+                expected_postimage_hash: None,
+            }],
+            verification_recipe: None,
+            verification_command: None,
+        };
+        assert_eq!(
+            sf.apply_delegated_work_edits(&grow_plan, &journals, &scope, |_| Ok(())).unwrap_err().code,
+            ErrorCode::ResourceBudgetExceeded
+        );
+        assert_eq!(fs::read_to_string(root.join("_pro/work/w1/a.py")).unwrap(), "ALPHA\n");
     }
 }

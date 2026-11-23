@@ -1,9 +1,9 @@
 //! Seal evidence only when the verified MXC supervisor supplies both snapshot digests.
 use anyhow::{Context, Result, ensure};
 use bridge_core::evidence::{
-    DELEGATED_WORKLOAD_REPORT_EXECUTOR, DELEGATED_WORKLOAD_REPORT_NOTE, PROVENANCE_DISCLAIMER,
-    load_or_create_device_signing_key, render_evidence_markdown,
-    scan_and_redact_secrets, seal_and_sign_manifest,
+    DELEGATED_WORK_COPY_EXECUTOR, DELEGATED_WORK_COPY_NOTE, DELEGATED_WORKLOAD_REPORT_EXECUTOR,
+    DELEGATED_WORKLOAD_REPORT_NOTE, PROVENANCE_DISCLAIMER, load_or_create_device_signing_key,
+    render_evidence_markdown, scan_and_redact_secrets, seal_and_sign_manifest,
 };
 use bridge_core::state::{StateStore, sqlite_runtime_version};
 use bridge_platform::sha256_bytes;
@@ -22,6 +22,7 @@ pub struct QueuedRunEvidence<'a> {
     pub test_log: &'a str,
     pub recipe: &'a str,
     pub delegated: bool,
+    pub work_workspace: Option<&'a str>,
     pub terminal: JobState,
     pub partial_output: bool,
     pub cleanup_confirmed: bool,
@@ -134,18 +135,58 @@ fn prepare(input: &QueuedRunEvidence<'_>, terminal: JobState) -> Result<Evidence
         outcome.verification_outcome = Verdict::Cancelled;
     }
     let verdict = outcome.verification_outcome;
-    let executor = if input.delegated { DELEGATED_WORKLOAD_REPORT_EXECUTOR } else { "local-owner-queued-python-mxc" };
-    let claim = if input.delegated {
+    let is_work_copy = input.work_workspace.is_some();
+    let executor = if is_work_copy {
+        DELEGATED_WORK_COPY_EXECUTOR
+    } else if input.delegated {
+        DELEGATED_WORKLOAD_REPORT_EXECUTOR
+    } else {
+        "local-owner-queued-python-mxc"
+    };
+    let claim = if is_work_copy {
+        DELEGATED_WORK_COPY_NOTE
+    } else if input.delegated {
         DELEGATED_WORKLOAD_REPORT_NOTE
     } else if input.recipe == "powershell_script" {
         "Verified MXC process execution. The script's own assertions were not independently parsed."
     } else {
         "Verified MXC snapshot test results"
     };
-    let reproduce = if input.delegated {
+    let reproduce = if let Some(workspace) = input.work_workspace {
+        format!(
+            "Submit {} for workspace '{workspace}' with an active pro-agent grant and process it with the owner worker started with --allow-work-exec.",
+            input.recipe
+        )
+    } else if input.delegated {
         format!("Submit {} with an active delegated grant and process it with the owner worker.", input.recipe)
     } else {
         "Submit python_tests to the local queue, then approve the file list with run-queued-python-tests.".into()
+    };
+    let raw_scope: Vec<String> = serde_json::from_value(receipt["approved_files"].clone())?;
+    let effective_scope = if let Some(workspace) = input.work_workspace {
+        raw_scope
+            .into_iter()
+            .map(|file| format!("_pro/work/{workspace}/{file}"))
+            .collect()
+    } else {
+        raw_scope
+    };
+    let mut declared_units = BTreeMap::new();
+    if let Some(workspace) = input.work_workspace {
+        declared_units.insert("work_copy".into(), format!("_pro/work/{workspace}"));
+    }
+    let cwd = if let Some(workspace) = input.work_workspace {
+        format!("disposable work-copy snapshot (_pro/work/{workspace})")
+    } else {
+        "disposable project snapshot".into()
+    };
+    let untested_areas = if let Some(workspace) = input.work_workspace {
+        vec![
+            format!("Executed remote-modified work copy '_pro/work/{workspace}'; live project files were not tested or modified."),
+            "Files and behavior outside the work-copy snapshot scope.".into(),
+        ]
+    } else {
+        vec!["Files and behavior outside the recipe's snapshot scope.".into()]
     };
     let manifest_id = ManifestId::new_random();
     let artifact_id = ArtifactId::new_random();
@@ -170,7 +211,7 @@ fn prepare(input: &QueuedRunEvidence<'_>, terminal: JobState) -> Result<Evidence
         authorization: EvidenceAuthorizationGroup {
             grant_id: run.grant_id.clone(), requester_principal: run.requester_principal.clone(),
             executor_identity: executor.into(), policy_revision: input.policy_revision,
-            effective_scope: serde_json::from_value(receipt["approved_files"].clone())?, containment_probe_result: format!("Per-job canaries verified for MXC policy {policy}."),
+            effective_scope, containment_probe_result: format!("Per-job canaries verified for MXC policy {policy}."),
         },
         source: EvidenceSourceGroup {
             base_commit: None, dirty_input_manifest_sha256: before.into(), source_hash_before: before.into(),
@@ -179,7 +220,7 @@ fn prepare(input: &QueuedRunEvidence<'_>, terminal: JobState) -> Result<Evidence
         },
         inputs: EvidenceInputsGroup {
             config_hashes: BTreeMap::from([("mxc_policy".into(), policy.into())]),
-            declared_units: BTreeMap::new(), random_seed: None, synthetic_data: false,
+            declared_units, random_seed: None, synthetic_data: false,
         },
         environment: EvidenceEnvironmentGroup {
             os_build: std::env::consts::OS.into(), architecture: std::env::consts::ARCH.into(),
@@ -194,7 +235,7 @@ fn prepare(input: &QueuedRunEvidence<'_>, terminal: JobState) -> Result<Evidence
             isolation_backend: "codex-sandbox-mxc".into(),
         },
         command: EvidenceCommandGroup {
-            executable, argv, cwd: "disposable project snapshot".into(), redacted_env_keys: vec![],
+            executable, argv, cwd, redacted_env_keys: vec![],
             supervisor_pid: run.pid, process_start_recorded_outside_job: run.process_start_time_100ns.is_some(),
         },
         time: EvidenceTimeGroup {
@@ -210,16 +251,23 @@ fn prepare(input: &QueuedRunEvidence<'_>, terminal: JobState) -> Result<Evidence
         artifacts: vec![SealedArtifactRef {
             artifact_id: artifact_id.clone(), relative_path: LOG_NAME.into(), sha256: log_hash,
             size_bytes: input.test_log.len() as u64, media_type: "text/plain".into(),
-            capture_origin: if input.delegated { "Workload-reported output captured and redacted by the owner MXC supervisor" }
-                else { "Owner MXC supervisor output redacted before evidence export" }.into(),
+            capture_origin: if is_work_copy {
+                "Work-copy workload output captured and redacted by the owner MXC supervisor"
+            } else if input.delegated {
+                "Workload-reported output captured and redacted by the owner MXC supervisor"
+            } else {
+                "Owner MXC supervisor output redacted before evidence export"
+            }.into(),
             export_policy: "redacted_export_only".into(), secret_scan_passed: true,
         }],
         conclusions: EvidenceConclusionsGroup {
             overall_verdict: verdict,
             claims: vec![EvidenceClaim { claim: claim.into(), verdict, linked_artifact_ids: vec![artifact_id] }],
-            untested_areas: vec!["Files and behavior outside the recipe's snapshot scope.".into()],
+            untested_areas,
             reproduction_command: reproduce,
-            provenance_disclaimer: if input.delegated {
+            provenance_disclaimer: if is_work_copy {
+                format!("{PROVENANCE_DISCLAIMER} {DELEGATED_WORK_COPY_NOTE}")
+            } else if input.delegated {
                 format!("{PROVENANCE_DISCLAIMER} {DELEGATED_WORKLOAD_REPORT_NOTE}")
             } else {
                 PROVENANCE_DISCLAIMER.into()
@@ -245,5 +293,115 @@ mod tests {
 
         let result = persist::<()>(|| Ok(Err(anyhow::anyhow!("fixture manifest validation error"))));
         assert!(matches!(result, Err(EvidenceError::Rejected(_))));
+    }
+
+    #[test]
+    fn work_copy_evidence_manifest_marks_work_copy_executor_and_never_claims_project_tested() {
+        let now = Utc::now();
+        let run = DurableJobRecord {
+            run_id: RunId::new_random(),
+            task_id: TaskId("task_work_ev".into()),
+            host_id: HostId("host_ev".into()),
+            project_id: ProjectId("project_ev".into()),
+            workspace_id: WorkspaceId("ws_ev".into()),
+            grant_id: Some(GrantId::new_random()),
+            requester_principal: "executor:default".into(),
+            executor_identity: "mcp_task_submit".into(),
+            operation_id: OperationId("op_work_ev".into()),
+            dedup_key: "a".repeat(64),
+            payload_digest: "b".repeat(64),
+            state: JobState::Running,
+            pid: Some(42),
+            process_start_time_100ns: Some(100),
+            exit_code: None,
+            outcome: None,
+            evidence_manifest_id: None,
+            output_seq: 0,
+            output_truncated: false,
+            output_dir: "runs/run_ev".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        let log = "test_add (tests.test_calc.CalcTests) ... ok\n\nRan 1 test in 0.001s\n\nOK\n";
+        let tests = bridge_core::evidence::parse_python_unittest(log, true);
+        let receipt = serde_json::json!({
+            "policy_sha256": "1".repeat(64),
+            "test_snapshot_unchanged": true,
+            "approved_files": ["calc.py", "tests/__init__.py", "tests/test_calc.py"],
+            "provenance": {
+                "snapshot_before_sha256": "2".repeat(64),
+                "snapshot_after_sha256": "2".repeat(64),
+                "executable": "python.exe",
+                "executable_sha256": "3".repeat(64),
+                "argv": ["-I", "-S", "-B", "-m", "unittest", "-v", "tests.test_calc"],
+                "codex_version": "0.171.0",
+                "codex_sha256": "4".repeat(64),
+            },
+        });
+        let outcome = OutcomeTriad {
+            agent_outcome: Verdict::NotTested,
+            execution_outcome: Verdict::Pass,
+            verification_outcome: Verdict::NotTested,
+            soft_denied_tools: vec![],
+        };
+        let mut manifest = prepare(
+            &QueuedRunEvidence {
+                run: &run,
+                receipt: &receipt,
+                policy_revision: 1,
+                test_log: log,
+                recipe: "python_tests_work",
+                delegated: true,
+                work_workspace: Some("fix-1"),
+                terminal: JobState::Succeeded,
+                partial_output: false,
+                cleanup_confirmed: true,
+                tests,
+                outcome,
+                exit_code: Some(0),
+                started: now,
+                elapsed_ms: 50,
+            },
+            JobState::Succeeded,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.authorization.executor_identity, DELEGATED_WORK_COPY_EXECUTOR);
+        assert_eq!(manifest.conclusions.overall_verdict, Verdict::NotTested);
+        assert_eq!(
+            manifest.inputs.declared_units.get("work_copy").map(String::as_str),
+            Some("_pro/work/fix-1")
+        );
+        assert_eq!(manifest.command.cwd, "disposable work-copy snapshot (_pro/work/fix-1)");
+        assert_eq!(
+            manifest.authorization.effective_scope,
+            vec![
+                "_pro/work/fix-1/calc.py",
+                "_pro/work/fix-1/tests/__init__.py",
+                "_pro/work/fix-1/tests/test_calc.py",
+            ]
+        );
+        assert!(
+            manifest.conclusions.untested_areas.iter().any(|note| {
+                note.contains("_pro/work/fix-1") && note.contains("live project files were not tested")
+            }),
+            "{:?}",
+            manifest.conclusions.untested_areas
+        );
+        assert!(!manifest.conclusions.claims[0].claim.contains("Verified MXC snapshot test results"));
+        assert!(manifest.conclusions.claims[0].claim.contains("live project files were neither tested nor modified"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "epb-work-evid-{}-{}",
+            std::process::id(),
+            manifest.identity.manifest_id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sk, pk) = load_or_create_device_signing_key(&dir).unwrap();
+        seal_and_sign_manifest(&mut manifest, &sk);
+        let rep = bridge_core::evidence::verify_evidence_full(&manifest, Some(&pk), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rep.overall_verified, "{rep:?}");
+        assert_eq!(rep.reported_verdict, Verdict::NotTested);
     }
 }

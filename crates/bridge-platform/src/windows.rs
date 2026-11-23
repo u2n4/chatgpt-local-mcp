@@ -18,10 +18,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Registry::{
@@ -561,6 +564,64 @@ impl WinJobObject {
         }
         Ok(counts.ActiveProcesses)
     }
+
+    /// Enforce a hard CPU rate cap (`1..=100` percent) on every process in this Job Object.
+    /// Fails closed if Windows refuses to apply `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`.
+    pub fn set_cpu_hard_cap(&self, max_cpu_percent: u8) -> Result<(), BridgeError> {
+        if !(1..=100).contains(&max_cpu_percent) {
+            return Err(BridgeError::new(
+                ErrorCode::InvalidArgument,
+                "CPU hard cap percent must be between 1 and 100.",
+                OriginLayer::JobRunner,
+            ));
+        }
+        let info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+            ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+            Anonymous: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION_0 {
+                CpuRate: (max_cpu_percent as u32) * 100,
+            },
+        };
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectCpuRateControlInformation,
+                (&info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(BridgeError::new(
+                ErrorCode::InternalError,
+                format!("SetInformationJobObject(JobObjectCpuRateControlInformation) failed: {err}"),
+                OriginLayer::JobRunner,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Query the active CPU rate control flags and rate (in hundredths of a percent) on this Job Object.
+    pub fn query_cpu_rate_control(&self) -> Result<(u32, u32), BridgeError> {
+        let mut info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectCpuRateControlInformation,
+                (&mut info as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(BridgeError::new(
+                ErrorCode::InternalError,
+                "QueryInformationJobObject(JobObjectCpuRateControlInformation) failed.",
+                OriginLayer::JobRunner,
+            ));
+        }
+        let rate = unsafe { info.Anonymous.CpuRate };
+        Ok((info.ControlFlags, rate))
+    }
 }
 
 impl Drop for WinJobObject {
@@ -704,5 +765,28 @@ mod tests {
         job.terminate_tree(137).expect("terminate tree");
         let status = child.wait().expect("wait terminated child");
         assert_eq!(status.code(), Some(137));
+    }
+
+    #[test]
+    fn win32_job_object_cpu_hard_cap_sets_and_rejects_invalid_percent() {
+        let job = WinJobObject::new(256, 8).expect("create job object");
+        job.set_cpu_hard_cap(50).expect("set 50% hard cap");
+        let (flags, rate) = job.query_cpu_rate_control().expect("query cpu rate");
+        assert_eq!(
+            flags,
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+        );
+        assert_eq!(rate, 5000);
+
+        job.set_cpu_hard_cap(25).expect("tighten to 25% hard cap");
+        let (flags, rate) = job.query_cpu_rate_control().expect("query 25% cpu rate");
+        assert_eq!(
+            flags,
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+        );
+        assert_eq!(rate, 2500);
+
+        assert_eq!(job.set_cpu_hard_cap(0).unwrap_err().code, ErrorCode::InvalidArgument);
+        assert_eq!(job.set_cpu_hard_cap(101).unwrap_err().code, ErrorCode::InvalidArgument);
     }
 }

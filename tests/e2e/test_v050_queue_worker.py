@@ -108,17 +108,22 @@ class TestQueueWorker(unittest.TestCase):
         self.assertEqual(accepted["state"], "queued")
         return accepted["run_id"], grant
 
-    def worker_command(self, runtime=None, allow_environment_credentials=True):
+    def worker_command(self, runtime=None, allow_environment_credentials=True, allow_work_exec=False):
         if runtime is None:
             runtime = self.root / "runtime"
             if not runtime.exists():
                 make_runtime(runtime)
         # The machine that runs the tests may keep credentials in its persistent environment.
         allow = ["--allow-environment-credentials"] if allow_environment_credentials else []
+        if allow_work_exec:
+            allow.append("--allow-work-exec")
         return self.cli + ["worker", "--once", "--runtime-root", str(runtime)] + allow
 
-    def worker(self, runtime=None):
-        result = subprocess.run(self.worker_command(runtime), capture_output=True, encoding="utf-8", timeout=90)
+    def worker(self, runtime=None, *, allow_work_exec=False):
+        result = subprocess.run(
+            self.worker_command(runtime, allow_work_exec=allow_work_exec),
+            capture_output=True, encoding="utf-8", timeout=90,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         return [json.loads(line) for line in result.stdout.splitlines()]
 
@@ -887,6 +892,132 @@ class Example(unittest.TestCase):
         self.assertEqual(self.worker(), [])
         self.assertEqual(self.run_state(run_id)["state"], "unknown")
         self.assert_raw_removed(run_id)
+
+    def test_python_tests_work_requires_allow_work_exec_and_standard_python_tests_still_skips_pro_work(self):
+        (self.project / "calc.py").write_text("def add(a, b): return a + b\n", encoding="utf-8")
+        self.python_test("""\
+import unittest
+from calc import add
+
+class CalcTests(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
+""")
+        grant = self.command("grant-create", self.project_id, "--profile", "pro-agent")["grant_id"]
+        self.mcp(
+            "work_copy",
+            {"project_id": self.project_id, "grant_id": grant, "workspace": "fix-1", "paths": ["calc.py", "tests"]},
+            "executor:default",
+        )
+        self.mcp(
+            "file_write",
+            {
+                "project_id": self.project_id,
+                "grant_id": grant,
+                "operation_id": "plant-work-test",
+                "path": "_pro/work/fix-1/tests/test_planted_work.py",
+                "content": (
+                    "import unittest\nclass PlantedWork(unittest.TestCase):\n"
+                    "    def test_planted(self): print('PRO_WORK_PLANTED_RAN')\n"
+                ),
+            },
+            "executor:default",
+        )
+
+        # Standard python_tests under pro-agent still never executes anything under _pro/work/.
+        std_run, _ = self.queue("python_tests", [], task_id="std-skips-pro-work", grant=grant)
+        std_details = self.completed(std_run, "succeeded")
+        self.assertEqual(std_details["test_counts"]["executed"], 1)
+        self.assertNotIn("PRO_WORK_PLANTED_RAN", self.output(std_run, grant))
+
+        # python_tests_work without --allow-work-exec is refused before snapshot creation.
+        work_run, _ = self.queue("python_tests_work", ["fix-1"], task_id="work-no-flag", grant=grant)
+        refused, = self.worker(allow_work_exec=False)
+        self.assertEqual((refused["run"]["run_id"], refused["run"]["state"]), (work_run, "failed"))
+        self.assertEqual(refused["failure_code"], "WORK_EXEC_NOT_ENABLED", refused)
+        self.assertFalse((self.state / "runs" / work_run).exists())
+        self.assert_no_workload_manifest(work_run)
+
+    def test_python_tests_work_runs_work_copy_with_selector_hidden_filter_and_signed_work_evidence(self):
+        # Plant a failing live project bug, copy into _pro/work/fix-1, and fix only the work copy.
+        (self.project / "calc.py").write_text("def add(a, b): return a - b\n", encoding="utf-8")
+        self.python_test("""\
+from pathlib import Path
+import unittest
+from calc import add
+
+class CalcTests(unittest.TestCase):
+    def test_add(self):
+        self.assertFalse(Path('.env').exists())
+        self.assertEqual(add(2, 3), 5)
+
+    def test_other(self):
+        self.assertEqual(add(10, 4), 14)
+""")
+        grant = self.command("grant-create", self.project_id, "--profile", "pro-agent")["grant_id"]
+        self.mcp(
+            "work_copy",
+            {"project_id": self.project_id, "grant_id": grant, "workspace": "fix-1", "paths": ["calc.py", "tests"]},
+            "executor:default",
+        )
+        self.mcp(
+            "work_edit",
+            {
+                "project_id": self.project_id,
+                "grant_id": grant,
+                "workspace": "fix-1",
+                "operation_id": "fix-calc",
+                "edits": [{"path": "calc.py", "replacements": [{"old_text": "a - b", "new_text": "a + b"}]}],
+            },
+            "executor:default",
+        )
+        # Drop a hidden file inside the workspace on disk; it must never enter the sandbox snapshot.
+        (self.project / "_pro" / "work" / "fix-1" / ".env").write_text("SECRET_TOKEN=work_hidden_sentinel\n", encoding="utf-8")
+
+        found = self.command("environment-check")
+        run_all, _ = self.queue("python_tests_work", ["fix-1"], task_id="work-all", grant=grant)
+        details, = self.worker(allow_work_exec=True)
+        if found["credential_like_count"] > 0:
+            # Persistent-env credentials stay mandatory for python_tests_work even with --allow-environment-credentials.
+            self.assertEqual(details["run"]["state"], "failed")
+            self.assertTrue(
+                details["failure_code"].startswith("PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS:"),
+                "Expected mandatory credential refusal for python_tests_work",
+            )
+            self.assertFalse((self.state / "runs" / run_all).exists())
+            self.assert_no_workload_manifest(run_all)
+            return
+
+        self.assertEqual(details["run"]["state"], "succeeded", details)
+        self.assertEqual(details["test_counts"]["executed"], 2)
+        self.assertEqual(details["test_counts"]["passed"], 2)
+        self.assertNotIn(".env", details["mxc_receipt"]["approved_files"])
+        self.assertNotIn("work_hidden_sentinel", self.output(run_all, grant))
+        self.assert_raw_removed(run_all)
+        manifest = self.assert_signed_capture(details)
+        self.assertEqual(manifest["authorization"]["executor_identity"], "local-owner-mxc-work-copy-worker")
+        self.assertEqual(manifest["conclusions"]["overall_verdict"], "NOT_TESTED")
+        self.assertTrue(
+            any("_pro/work/fix-1" in note and "live project files were not tested" in note
+                for note in manifest["conclusions"]["untested_areas"]),
+            manifest["conclusions"]["untested_areas"],
+        )
+        # Live project file remains unmodified with the planted bug.
+        self.assertEqual((self.project / "calc.py").read_text(encoding="utf-8"), "def add(a, b): return a - b\n")
+
+        # Targeted single-test selector runs only the selected test method.
+        run_one, _ = self.queue(
+            "python_tests_work",
+            ["fix-1", "tests.test_worker.CalcTests.test_add"],
+            task_id="work-single",
+            grant=grant,
+        )
+        one_details, = self.worker(allow_work_exec=True)
+        self.assertEqual(one_details["run"]["state"], "succeeded", one_details)
+        self.assertEqual(one_details["test_counts"]["executed"], 1)
+        self.assertEqual(one_details["test_counts"]["passed"], 1)
+        self.assert_raw_removed(run_one)
+        self.assert_signed_capture(one_details)
 
 
 if __name__ == "__main__":

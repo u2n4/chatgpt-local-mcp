@@ -80,4 +80,27 @@ mod tests {
         assert!(JobState::Unknown.can_transition_to(JobState::Succeeded));
         assert!(JobState::Unknown.can_transition_to(JobState::Failed));
     }
+
+    #[test]
+    fn operation_category_work_area_serializes_as_snake_case_without_schema_bump() {
+        assert_eq!(SQLITE_SCHEMA_VERSION, 4);
+        assert_eq!(
+            serde_json::to_string(&OperationCategory::WorkArea).unwrap(),
+            "\"work_area\""
+        );
+        assert_eq!(
+            serde_json::from_str::<OperationCategory>("\"work_area\"").unwrap(),
+            OperationCategory::WorkArea
+        );
+        let schemas = export_contract_schemas();
+        let grant_schema = schemas
+            .iter()
+            .find(|(name, _)| *name == "v0.4.0-task-grant.schema.json")
+            .map(|(_, val)| val)
+            .expect("task grant schema");
+        let variants = grant_schema["$defs"]["OperationCategory"]["enum"]
+            .as_array()
+            .expect("OperationCategory enum array");
+        assert!(variants.iter().any(|v| v == "work_area"));
+    }
 }

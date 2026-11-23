@@ -697,6 +697,8 @@ impl StateStore {
         Ok(changed > 0)
     }
 
+    pub const DEFAULT_KEEP_RECENT_TERMINAL_RUN_OUTPUTS: usize = 200;
+
     /// Persist a durable run atomically before dispatching side effects (dedup-checked).
     /// Returns `Ok((record, created_new))`. Rejects key reuse with a mismatched payload digest!
     pub fn claim_durable_run(
@@ -704,18 +706,81 @@ impl StateStore {
         record: &DurableJobRecord,
         command_json: &str,
     ) -> Result<(DurableJobRecord, bool), BridgeError> {
-        let db = self.conn.lock().map_err(lock_err)?;
+        self.claim_durable_run_with_grant_limit(record, command_json, None)
+    }
+
+    /// Persist a durable run atomically, optionally enforcing a cap on active/queued runs
+    /// per grant for newly created runs while still allowing idempotent replay of an
+    /// already-claimed `operation_id`.
+    pub fn claim_durable_run_with_grant_limit(
+        &self,
+        record: &DurableJobRecord,
+        command_json: &str,
+        max_active_for_grant: Option<u64>,
+    ) -> Result<(DurableJobRecord, bool), BridgeError> {
+        let mut db = self.conn.lock().map_err(lock_err)?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        let existing_id: Option<String> = tx
+            .query_row(
+                "SELECT run_id FROM durable_runs WHERE dedup_key = ?1",
+                params![record.dedup_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        if let Some(winner_id) = existing_id {
+            let winner = Self::read_durable_run(&tx, &winner_id)?.ok_or_else(|| {
+                BridgeError::new(ErrorCode::NotFound, "Existing run vanished.", OriginLayer::StateStore)
+            })?;
+            tx.commit().map_err(db_err)?;
+            if winner.payload_digest != record.payload_digest
+                || winner.task_id != record.task_id
+                || winner.workspace_id != record.workspace_id
+                || winner.grant_id != record.grant_id
+                || winner.executor_identity != record.executor_identity
+            {
+                return Err(BridgeError::new(
+                    ErrorCode::IdempotencyPayloadMismatch,
+                    "Duplicate operation_id supplied with a different payload or run context.",
+                    OriginLayer::JobRunner,
+                ));
+            }
+            return Ok((winner, false));
+        }
+
+        if let (Some(limit), Some(grant_id)) = (max_active_for_grant, record.grant_id.as_ref()) {
+            let active: u64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM durable_runs
+                     WHERE grant_id = ?1
+                       AND state IN ('queued','admitted','running','cancelling','input_required')",
+                    params![grant_id.0],
+                    |r| Ok(r.get::<_, i64>(0)? as u64),
+                )
+                .map_err(db_err)?;
+            if active >= limit {
+                return Err(BridgeError::new(
+                    ErrorCode::ResourceBudgetExceeded,
+                    format!(
+                        "Grant '{}' already has {} active or queued runs (maximum {}). Wait for or cancel an existing run before submitting another.",
+                        grant_id.0, active, limit
+                    ),
+                    OriginLayer::Policy,
+                ));
+            }
+        }
+
         let state_str = serde_json::to_value(record.state).unwrap().as_str().unwrap().to_string();
-        // The unique index arbitrates admission across separate connections and processes.
-        let inserted = db.execute(
+        tx.execute(
             "INSERT INTO durable_runs(
                 run_id, task_id, host_id, project_id, workspace_id, grant_id,
                 requester_principal, executor_identity, operation_id, dedup_key, payload_digest,
                 state, pid, process_start_time_100ns, exit_code, agent_outcome, execution_outcome,
                 verification_outcome, evidence_manifest_id, output_seq, output_truncated,
                 output_dir, command_json, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,0,0,?20,?21,?22,?23)
-            ON CONFLICT(dedup_key) DO NOTHING",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,0,0,?20,?21,?22,?23)",
             params![
                 record.run_id.0,
                 record.task_id.0,
@@ -743,32 +808,42 @@ impl StateStore {
             ],
         )
         .map_err(db_err)?;
-        if inserted == 1 {
-            return Ok((record.clone(), true));
-        }
+        tx.commit().map_err(db_err)?;
+        Ok((record.clone(), true))
+    }
 
-        let winner_id: String = db.query_row(
-            "SELECT run_id FROM durable_runs WHERE dedup_key = ?1",
-            params![record.dedup_key],
-            |r| r.get(0),
-        ).map_err(db_err)?;
-        drop(db);
-        let winner = self.get_durable_run(&winner_id)?.ok_or_else(|| {
-            BridgeError::new(ErrorCode::NotFound, "Existing run vanished.", OriginLayer::StateStore)
-        })?;
-        if winner.payload_digest != record.payload_digest
-            || winner.task_id != record.task_id
-            || winner.workspace_id != record.workspace_id
-            || winner.grant_id != record.grant_id
-            || winner.executor_identity != record.executor_identity
-        {
-            return Err(BridgeError::new(
-                ErrorCode::IdempotencyPayloadMismatch,
-                "Duplicate operation_id supplied with a different payload or run context.",
-                OriginLayer::JobRunner,
-            ));
-        }
-        Ok((winner, false))
+    pub fn count_active_runs_for_grant(&self, grant_id: &str) -> Result<u64, BridgeError> {
+        let db = self.conn.lock().map_err(lock_err)?;
+        db.query_row(
+            "SELECT COUNT(*) FROM durable_runs
+             WHERE grant_id = ?1
+               AND state IN ('queued','admitted','running','cancelling','input_required')",
+            params![grant_id],
+            |r| Ok(r.get::<_, i64>(0)? as u64),
+        )
+        .map_err(db_err)
+    }
+
+    /// Delete stored `run_output_chunks` rows for terminal runs older than the most recent
+    /// `keep_recent_terminal_runs` terminal runs, preserving `durable_runs` and
+    /// `evidence_manifests` audit rows and leaving active runs untouched.
+    pub fn prune_old_run_outputs(&self, keep_recent_terminal_runs: usize) -> Result<usize, BridgeError> {
+        let db = self.conn.lock().map_err(lock_err)?;
+        db.execute(
+            "DELETE FROM run_output_chunks
+             WHERE run_id IN (
+                 SELECT run_id FROM durable_runs
+                 WHERE state IN ('succeeded','failed','cancelled','timed_out','interrupted')
+                   AND run_id NOT IN (
+                       SELECT run_id FROM durable_runs
+                       WHERE state IN ('succeeded','failed','cancelled','timed_out','interrupted')
+                       ORDER BY updated_at DESC, run_id DESC
+                       LIMIT ?1
+                   )
+             )",
+            params![keep_recent_terminal_runs as i64],
+        )
+        .map_err(db_err)
     }
 
     /// Only the interactive owner command calls this admission gate. The recipe must
@@ -963,6 +1038,10 @@ impl StateStore {
             BridgeError::new(ErrorCode::NotFound, "Run missing after transition.", OriginLayer::StateStore)
         })?;
         tx.commit().map_err(db_err)?;
+        drop(db);
+        if next_state.is_terminal() {
+            let _ = self.prune_old_run_outputs(Self::DEFAULT_KEEP_RECENT_TERMINAL_RUN_OUTPUTS);
+        }
         Ok(run)
     }
 
@@ -1952,5 +2031,218 @@ mod tests {
             (limits.max_duration_seconds, limits.max_memory_mb, limits.max_processes, limits.max_output_bytes, limits.max_storage_bytes),
             (0, 0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn count_active_runs_for_grant_and_limit_allow_idempotent_replay() {
+        let (_dir, store, base_run, grant) = queued_executor_fixture();
+        store.create_task_grant(&grant).unwrap();
+        let gid = grant.grant_id.0.as_str();
+        assert_eq!(store.count_active_runs_for_grant(gid).unwrap(), 0);
+
+        let mut runs = Vec::new();
+        for idx in 0..8 {
+            let mut r = base_run.clone();
+            r.run_id = RunId::new_random();
+            r.operation_id = OperationId(format!("op_limit_{idx}"));
+            r.dedup_key = sha256_bytes(format!("dedup_limit_{idx}").as_bytes());
+            let (claimed, created) = store
+                .claim_durable_run_with_grant_limit(&r, "{}", Some(8))
+                .unwrap();
+            assert!(created);
+            runs.push(claimed);
+        }
+        assert_eq!(store.count_active_runs_for_grant(gid).unwrap(), 8);
+
+        // Idempotent replay of an already-claimed operation_id succeeds even at the 8-run cap.
+        let mut replay = runs[7].clone();
+        replay.run_id = RunId::new_random();
+        let (replayed, created) = store
+            .claim_durable_run_with_grant_limit(&replay, "{}", Some(8))
+            .unwrap();
+        assert!(!created);
+        assert_eq!(replayed.run_id, runs[7].run_id);
+
+        // A brand-new 9th run for the same grant is refused with ResourceBudgetExceeded.
+        let mut ninth = base_run.clone();
+        ninth.run_id = RunId::new_random();
+        ninth.operation_id = OperationId("op_limit_9".into());
+        ninth.dedup_key = sha256_bytes(b"dedup_limit_9");
+        let err = store
+            .claim_durable_run_with_grant_limit(&ninth, "{}", Some(8))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ResourceBudgetExceeded);
+
+        // Transitioning one run to a terminal state frees a slot.
+        store
+            .transition_durable_run(&runs[0].run_id.0, JobState::Cancelled, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(store.count_active_runs_for_grant(gid).unwrap(), 7);
+        let (_claimed, created) = store
+            .claim_durable_run_with_grant_limit(&ninth, "{}", Some(8))
+            .unwrap();
+        assert!(created);
+        assert_eq!(store.count_active_runs_for_grant(gid).unwrap(), 8);
+    }
+
+    #[test]
+    fn prune_old_run_outputs_deletes_old_terminal_chunks_and_preserves_audit_rows() {
+        let (_dir, store, base_run, grant) = queued_executor_fixture();
+        store.create_task_grant(&grant).unwrap();
+
+        // Create 4 terminal runs with distinct timestamps, outputs, and evidence manifests,
+        // plus 1 active queued run with output.
+        let mut terminal_ids = Vec::new();
+        let mut manifest_ids = Vec::new();
+        for idx in 0..4 {
+            let mut r = base_run.clone();
+            r.run_id = RunId(format!("run_term_{idx}"));
+            r.operation_id = OperationId(format!("op_term_{idx}"));
+            r.dedup_key = sha256_bytes(format!("dedup_term_{idx}").as_bytes());
+            store.claim_durable_run(&r, "{}").unwrap();
+            store
+                .append_run_output_batch(&r.run_id.0, &[("stdout", "line1\n"), ("stderr", "line2\n")], false)
+                .unwrap();
+            let mid = ManifestId::new_random();
+            let now = Utc::now();
+            let manifest: EvidenceManifest = serde_json::from_value(serde_json::json!({
+                "identity": {
+                    "manifest_id": mid,
+                    "report_format_version": REPORT_FORMAT_VERSION,
+                    "run_id": r.run_id,
+                    "task_id": r.task_id,
+                    "host_id": r.host_id,
+                    "project_id": r.project_id,
+                    "workspace_id": r.workspace_id,
+                    "broker_version": BRIDGE_VERSION,
+                    "runner_version": "test",
+                    "adapter_version": "test",
+                    "evidence_class": "software_unit"
+                },
+                "authorization": {
+                    "grant_id": grant.grant_id,
+                    "requester_principal": grant.requester_principal,
+                    "executor_identity": "test",
+                    "policy_revision": 1,
+                    "effective_scope": [],
+                    "containment_probe_result": "verified"
+                },
+                "source": {
+                    "dirty_input_manifest_sha256": "",
+                    "source_hash_before": "",
+                    "source_hash_after": "",
+                    "test_suite_manifest_sha256": "",
+                    "test_suite_modified": false
+                },
+                "inputs": {
+                    "config_hashes": {},
+                    "declared_units": {},
+                    "synthetic_data": false
+                },
+                "environment": {
+                    "os_build": "test",
+                    "architecture": "x86_64",
+                    "host_name": "test",
+                    "toolchain_versions": {},
+                    "resolved_executable": "python",
+                    "resolved_executable_sha256": "",
+                    "isolation_backend": "test"
+                },
+                "command": {
+                    "executable": "python",
+                    "argv": [],
+                    "cwd": ".",
+                    "redacted_env_keys": [],
+                    "process_start_recorded_outside_job": true
+                },
+                "time": {
+                    "started_at_utc": now,
+                    "finished_at_utc": now,
+                    "monotonic_duration_ms": 1,
+                    "clock_uncertainty_note": ""
+                },
+                "execution": {
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "cancelled": false,
+                    "policy_denied": false,
+                    "partial_output": false,
+                    "cleanup_confirmed": true,
+                    "outcome_triad": {
+                        "agent_outcome": "NOT_TESTED",
+                        "execution_outcome": "PASS",
+                        "verification_outcome": "NOT_TESTED",
+                        "soft_denied_tools": []
+                    }
+                },
+                "tests": {
+                    "parser_name": "none",
+                    "parser_version": "test",
+                    "discovered": 0,
+                    "executed": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "results_artifact_sha256": "",
+                    "fresh_for_run": true,
+                    "cases": []
+                },
+                "artifacts": [],
+                "conclusions": {
+                    "overall_verdict": "NOT_TESTED",
+                    "claims": [],
+                    "untested_areas": [],
+                    "reproduction_command": "",
+                    "provenance_disclaimer": "test"
+                }
+            })).unwrap();
+            store.save_evidence_manifest(&manifest, None, None).unwrap();
+            store
+                .transition_durable_run(&r.run_id.0, JobState::Cancelled, None, None, None, None, Some(mid.as_str()))
+                .unwrap();
+            // Pin deterministic updated_at ordering so run_term_0..3 are ordered oldest -> newest.
+            let ts = format!("2026-01-01T00:00:0{idx}Z");
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE durable_runs SET updated_at = ?1 WHERE run_id = ?2",
+                    params![ts, r.run_id.0],
+                )
+                .unwrap();
+            terminal_ids.push(r.run_id.0);
+            manifest_ids.push(mid.0);
+        }
+
+        let mut active = base_run.clone();
+        active.run_id = RunId("run_active_0".into());
+        active.operation_id = OperationId("op_active_0".into());
+        active.dedup_key = sha256_bytes(b"dedup_active_0");
+        store.claim_durable_run(&active, "{}").unwrap();
+        store
+            .append_run_output(&active.run_id.0, "stdout", "still running\n", false)
+            .unwrap();
+
+        // Keep only the 2 most recent terminal runs (run_term_2, run_term_3).
+        let deleted = store.prune_old_run_outputs(2).unwrap();
+        assert_eq!(deleted, 4); // 2 chunks each for run_term_0 and run_term_1
+
+        assert!(store.read_run_output(&terminal_ids[0], 0, 10).unwrap().is_empty());
+        assert!(store.read_run_output(&terminal_ids[1], 0, 10).unwrap().is_empty());
+        assert_eq!(store.read_run_output(&terminal_ids[2], 0, 10).unwrap().len(), 2);
+        assert_eq!(store.read_run_output(&terminal_ids[3], 0, 10).unwrap().len(), 2);
+        assert_eq!(store.read_run_output(&active.run_id.0, 0, 10).unwrap().len(), 1);
+
+        // durable_runs and evidence_manifests audit rows stay intact for pruned runs.
+        for (rid, mid) in terminal_ids.iter().zip(manifest_ids.iter()) {
+            assert!(store.get_durable_run(rid).unwrap().is_some(), "{rid}");
+            assert!(store.get_evidence_manifest(mid).unwrap().is_some(), "{mid}");
+        }
+
+        // Pruning with keep=0 removes remaining terminal chunks while keeping active run chunks.
+        let deleted_rest = store.prune_old_run_outputs(0).unwrap();
+        assert_eq!(deleted_rest, 4);
+        assert_eq!(store.read_run_output(&active.run_id.0, 0, 10).unwrap().len(), 1);
     }
 }

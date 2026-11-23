@@ -4,7 +4,7 @@ Edge Project Bridge lets a remote AI model read one local project folder, create
 
 ## Quick install
 
-Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.5.0-pre4`), and run these three steps.
+Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.6.0-pre1`), and run these three steps.
 
 ### 1. Download `install.ps1` and `SHA256SUMS.txt`
 
@@ -66,10 +66,11 @@ The installer always installs the core level. It does not install software for y
 
 ## What the remote model can and cannot do
 
-Under the `pro-review` grant created by `new-grant.ps1`:
+`new-grant.ps1` supports two grant profiles (`pro-review` is the default):
 
-- It **can** read project files (excluding secret/credential files) and create **new** files under `_pro\outbox\` and `_pro\reports\`.
-- It **cannot** write under `_pro\inbox\`, and it **cannot** change, move, or delete any existing project file.
+- **`pro-review` (`.\new-grant.ps1`):** reads project files (excluding secret/credential files), creates **new** files only under `_pro\outbox\` and `_pro\reports\`, and can queue `python_tests` and `powershell_script` against live project files. None of the `work_*` tools is available.
+- **`pro-agent` (`.\new-grant.ps1 -Profile pro-agent`):** adds mutable workspaces strictly under `_pro\work\<workspace>\` (`work_copy`, `work_edit`, `work_move`, `work_delete`, `work_diff`, `work_export_diff`) and the `python_tests_work` recipe. Live project files outside `_pro\work\` remain read-only; apply reviewed changes locally with `edge-bridge work-apply`.
+- Under **both** profiles, the model **cannot** write under `_pro\inbox\`, and it **cannot** change, move, or delete live project files.
 
 > Tip: keep `_pro/` out of Git by adding `_pro/` to `.git/info/exclude` in your project.
 
@@ -111,13 +112,17 @@ Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjec
 
    Sandboxed runs can read persistent user and machine environment variables stored in the Windows registry. While any entry looks like a credential, the worker refuses test runs with `PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS`. Remove those entries from the persistent Windows environment, or start `edge-bridge.exe` manually with `--allow-environment-credentials` only if you explicitly accept that test runs can read them.
 
-2. **Create a temporary permission pass (`pro-review` grant, valid for 60 minutes by default):**
+2. **Create a temporary permission pass (valid for 60 minutes by default):**
 
    ```powershell
+   # Review-only (default: pro-review)
    .\new-grant.ps1
+
+   # Workspace editing under _pro\work\<workspace>\ (pro-agent)
+   .\new-grant.ps1 -Profile pro-agent
    ```
 
-   This prints `grant_id`, `expires_at`, and `project_id`.
+   This prints `profile`, `grant_id`, `expires_at`, and `project_id`.
 
 3. **Start the local test worker** (from a normal interactive Windows desktop session—not a background service or headless session):
 
@@ -127,9 +132,24 @@ Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjec
    .\start-worker.ps1
    ```
 
-   Leave this window open while you want queued test runs executed (press `Ctrl+C` to stop it). Pass `--once` (`.\start-worker.ps1 --once`) to run at most one queued job and exit (it exits quietly with no output when the queue is empty).
+   Leave this window open while you want queued test runs executed (press `Ctrl+C` to stop it). Pass `--once` (`.\start-worker.ps1 --once`) to drain the current queue and exit (it exits quietly with no output when the queue is empty).
 
-4. **Connect an MCP client:**
+   **`--allow-work-exec` is off by default** (and `start-worker.ps1` does not pass it). Without it, `python_tests_work` is refused with `WORK_EXEC_NOT_ENABLED`, while a `pro-agent` model can still copy, edit, diff, and export patches in `_pro\work\` and run the project's own `python_tests`. Only pass `.\start-worker.ps1 --allow-work-exec` if you explicitly accept the sandbox registry risk documented in `docs/KNOWN_LIMITATIONS.md` (measured on one PC: no network and no folder outside the snapshot, but Windows user name, profile paths, `HKCU\Software`, `HKLM\Software`, and `HKCU\Environment` are reachable by remote-authored code). `powershell_script_work` is refused everywhere.
+
+4. **Apply a `pro-agent` workspace locally (owner CLI):**
+
+   ```powershell
+   # Dry run (shows planned changes and diff without modifying project files)
+   .\bin\edge-bridge.exe --state-dir=.\state work-apply <project_id> <workspace>
+
+   # Apply atomically (all files or none) and save a rollback journal
+   .\bin\edge-bridge.exe --state-dir=.\state work-apply <project_id> <workspace> --confirm
+
+   # Roll back if needed (refuses to overwrite later edits)
+   .\bin\edge-bridge.exe --state-dir=.\state rollback-patch --project-root <project> --journal-id <journal_id>
+   ```
+
+5. **Connect an MCP client:**
 
    For a local MCP client that launches a command over standard input/output (stdio), configure the exact **Program** and **Arguments** printed by the installer:
 
@@ -170,7 +190,7 @@ Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjec
 - `<InstallDir>\runtime\` — Python worker files and (when `uv` and Python 3.13 are present) `<InstallDir>\runtime\.venv\`, built with `uv --no-config sync --locked --no-python-downloads` after clearing shell `UV_*`/`VIRTUAL_ENV` overrides (`uv` still uses its own cache outside `<InstallDir>`).
 - `<InstallDir>\state\state.sqlite3` (and SQLite journal files) — state database with your project registered.
 - `<InstallDir>\install.json` — saved install paths and `project_id`. Helper scripts run the binary recorded here, so keep `<InstallDir>` writable only by you.
-- `<InstallDir>\environment-check.ps1`, `new-grant.ps1`, `setup-worker.ps1`, `start-worker.ps1` — helper scripts (`setup-worker.ps1` builds `<InstallDir>\runtime\.venv` with `uv` and Python 3.13; it does not check pinned PowerShell/Codex hashes).
+- `<InstallDir>\environment-check.ps1`, `new-grant.ps1`, `setup-worker.ps1`, `start-worker.ps1` — helper scripts (`new-grant.ps1` accepts `-Profile pro-review` [default] or `-Profile pro-agent`; `start-worker.ps1` does not pass `--allow-work-exec` by default; `setup-worker.ps1` builds `<InstallDir>\runtime\.venv` with `uv` and Python 3.13 without checking pinned PowerShell/Codex hashes).
 - Documentation and license files from the release zip (`LICENSE`, `README.md`, `SECURITY_BOUNDARIES.md`, `docs\`).
 - `<ProjectPath>\_pro\`, `_pro\inbox\`, `_pro\outbox\`, `_pro\reports\` — created only if missing; existing project files are never modified.
 - Temporary folders deleted on exit (`%TEMP%\epb-install-<id>\` and staging folders inside `<InstallDir>`).

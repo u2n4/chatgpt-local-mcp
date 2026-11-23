@@ -81,8 +81,10 @@ class McpWireSchemasTest(unittest.IsolatedAsyncioTestCase):
             listed = await session.list_tools()
             tools = list(listed.tools)
             names = [tool.name for tool in tools]
-            self.assertEqual(len(names), 39)
-            self.assertEqual(len(set(names)), 39)
+            self.assertEqual(len(names), 46)
+            self.assertEqual(len(set(names)), 46)
+            self.assertNotIn("work_apply", names)
+            self.assertNotIn("work-apply", names)
 
             for tool in tools:
                 jsonschema.Draft202012Validator.check_schema(tool.inputSchema)
@@ -98,6 +100,13 @@ class McpWireSchemasTest(unittest.IsolatedAsyncioTestCase):
                 "task_get": ["project_id", "task_id"],
                 "task_submit": ["project_id", "task_id", "operation_id"],
                 "job_get": ["project_id", "job_id"],
+                "job_wait": ["project_id", "job_ids"],
+                "work_copy": ["project_id", "workspace"],
+                "work_edit": ["project_id", "workspace", "operation_id", "edits"],
+                "work_move": ["project_id", "workspace", "operation_id", "from", "to"],
+                "work_delete": ["project_id", "workspace", "operation_id"],
+                "work_diff": ["project_id", "workspace"],
+                "work_export_diff": ["project_id", "workspace", "operation_id", "path"],
                 "artifact_read": ["project_id", "artifact_id"],
             }
             for tool_name, required in expected_required.items():
@@ -147,6 +156,15 @@ class McpWireSchemasTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 by_name["file_write"].description.startswith("Not callable from this read-only connection")
             )
+            self.assertTrue(
+                by_name["job_wait"].description.startswith("Not callable from this read-only connection")
+            )
+            for work_tool in ("work_copy", "work_edit", "work_move", "work_delete", "work_diff", "work_export_diff"):
+                self.assertTrue(
+                    by_name[work_tool].description.startswith("Not callable from this read-only connection"),
+                    work_tool,
+                )
+                self.assertIsNotNone(by_name[work_tool].outputSchema, work_tool)
 
             # Several agents share one connection: every concurrent call gets its own answer.
             burst = await asyncio.gather(

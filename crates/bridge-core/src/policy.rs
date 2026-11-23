@@ -22,6 +22,25 @@ pub const PRO_REVIEW_WRITABLE_PATH: &str = "_pro/**";
 pub const DELEGATED_DENIED_PATHS: [&str; 1] = ["_pro/inbox/**"];
 pub const PRO_REVIEW_RECIPES: [&str; 2] = ["python_tests", "powershell_script"];
 
+pub const PYTHON_TESTS_WORK_RECIPE: &str = "python_tests_work";
+pub const POWERSHELL_SCRIPT_WORK_RECIPE: &str = "powershell_script_work";
+
+pub const PRO_AGENT_CATEGORIES: [OperationCategory; 6] = [
+    OperationCategory::Read,
+    OperationCategory::GitRead,
+    OperationCategory::Write,
+    OperationCategory::Patch,
+    OperationCategory::WorkArea,
+    OperationCategory::ExecuteRecipe,
+];
+pub const PRO_AGENT_RECIPES: [&str; 3] = [
+    "python_tests",
+    "powershell_script",
+    PYTHON_TESTS_WORK_RECIPE,
+];
+pub const PRO_WORK_PREFIX: &str = "_pro/work/";
+pub const MAX_WORKSPACES_PER_PROJECT: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct AuthorizationDecision {
     pub project: ProjectRow,
@@ -62,7 +81,54 @@ impl<'a> PolicyEngine<'a> {
     ) -> Result<AuthorizationDecision, BridgeError> {
         self.authorize_action(
             principal, project_id, category, target_path, RecipePermission::Execute(recipe),
+            grant_id_hint, false,
+        )
+    }
+
+    /// Authorize a work-area mutation or workspace-scoped operation strictly inside exact-case
+    /// `_pro/work/<work_name>[/<rel_subpath>]`.
+    ///
+    /// Pass `rel_subpath = Some(path)` for file-level overwrite, patch, copy, move, or delete,
+    /// and `rel_subpath = None` for workspace-level operations (such as workspace diff or
+    /// whole-workspace delete).
+    pub fn authorize_work_mutation(
+        &self,
+        principal: &Principal,
+        project_id: &str,
+        work_name: &str,
+        rel_subpath: Option<&str>,
+        grant_id_hint: Option<&str>,
+    ) -> Result<AuthorizationDecision, BridgeError> {
+        if principal.is_edge() {
+            return Err(BridgeError::new(
+                ErrorCode::BridgePolicyDenied,
+                "Principal 'edge' is strictly read-only; operation 'WorkArea' requires an authorized DelegatedExecutor grant or Local owner action.",
+                OriginLayer::Policy,
+            ));
+        }
+        validate_work_name(work_name)?;
+        let (target, allow_workspace_root) = match rel_subpath {
+            Some(subpath) => {
+                let sub_parts = validate_remote_relative_path(subpath)?;
+                if sub_parts.is_empty() {
+                    return Err(BridgeError::new(
+                        ErrorCode::InvalidArgument,
+                        "A work-area file path cannot be empty or '.'.",
+                        OriginLayer::Policy,
+                    ));
+                }
+                (format!("{PRO_WORK_PREFIX}{work_name}/{}", sub_parts.join("/")), false)
+            }
+            None => (format!("{PRO_WORK_PREFIX}{work_name}"), true),
+        };
+        self.authorize_action(
+            principal,
+            project_id,
+            OperationCategory::WorkArea,
+            Some(&target),
+            RecipePermission::Execute(None),
             grant_id_hint,
+            allow_workspace_root,
         )
     }
 
@@ -75,7 +141,7 @@ impl<'a> PolicyEngine<'a> {
     ) -> Result<AuthorizationDecision, BridgeError> {
         self.authorize_action(
             principal, project_id, OperationCategory::ExecuteRecipe, None,
-            RecipePermission::RunOutput, grant_id_hint,
+            RecipePermission::RunOutput, grant_id_hint, false,
         )
     }
 
@@ -88,7 +154,7 @@ impl<'a> PolicyEngine<'a> {
     ) -> Result<AuthorizationDecision, BridgeError> {
         self.authorize_action(
             principal, project_id, OperationCategory::ExecuteRecipe, None,
-            RecipePermission::CancelGrant, grant_id_hint,
+            RecipePermission::CancelGrant, grant_id_hint, false,
         )
     }
 
@@ -123,8 +189,9 @@ impl<'a> PolicyEngine<'a> {
         target_path: Option<&str>,
         recipe_permission: RecipePermission<'_>,
         grant_id_hint: Option<&str>,
+        allow_workspace_root: bool,
     ) -> Result<AuthorizationDecision, BridgeError> {
-        let path_parts = if !principal.is_local() {
+        let path_parts = if !principal.is_local() || category == OperationCategory::WorkArea {
             target_path.map(validate_remote_relative_path).transpose()?
         } else {
             None
@@ -132,13 +199,27 @@ impl<'a> PolicyEngine<'a> {
         let project = self.store.get_project(project_id, principal)?;
 
         match principal {
-            Principal::Local => Ok(AuthorizationDecision {
-                project,
-                grant_id: None,
-                effective_scope: vec!["local_owner".to_string()],
-                normalized_write_path: None,
-                grant: None,
-            }),
+            Principal::Local => {
+                let normalized_write_path = if category == OperationCategory::WorkArea {
+                    let parts = path_parts.ok_or_else(|| {
+                        BridgeError::new(
+                            ErrorCode::InvalidArgument,
+                            "A target path under '_pro/work/<workspace>/' is required for a WorkArea operation.",
+                            OriginLayer::Policy,
+                        )
+                    })?;
+                    Some(validate_work_area_parts(&parts, allow_workspace_root)?)
+                } else {
+                    None
+                };
+                Ok(AuthorizationDecision {
+                    project,
+                    grant_id: None,
+                    effective_scope: vec!["local_owner".to_string()],
+                    normalized_write_path,
+                    grant: None,
+                })
+            }
             Principal::Edge => {
                 // Non-negotiable V0.4.0 rule (§6): `edge` principal remains strictly read-only.
                 if matches!(category, OperationCategory::Read | OperationCategory::GitRead) {
@@ -245,6 +326,30 @@ impl<'a> PolicyEngine<'a> {
                         ));
                     }
                     Some(path)
+                } else if category == OperationCategory::WorkArea {
+                    if grant.writable_paths != [PRO_REVIEW_WRITABLE_PATH] {
+                        return Err(BridgeError::new(
+                            ErrorCode::BridgePolicyDenied,
+                            "WorkArea operations require a grant whose writable_paths is strictly [\"_pro/**\"].",
+                            OriginLayer::Policy,
+                        ));
+                    }
+                    let parts = path_parts.ok_or_else(|| {
+                        BridgeError::new(
+                            ErrorCode::InvalidArgument,
+                            "A target path under '_pro/work/<workspace>/' is required for a WorkArea operation.",
+                            OriginLayer::Policy,
+                        )
+                    })?;
+                    let path = validate_work_area_parts(&parts, allow_workspace_root)?;
+                    if !path_allowed_by_grant(&path, &grant.writable_paths) {
+                        return Err(BridgeError::new(
+                            ErrorCode::BridgePolicyDenied,
+                            format!("WorkArea path '{path}' is outside grant writable_paths."),
+                            OriginLayer::Policy,
+                        ));
+                    }
+                    Some(path)
                 } else {
                     None
                 };
@@ -261,14 +366,37 @@ impl<'a> PolicyEngine<'a> {
                             OriginLayer::Policy,
                         )
                     })?;
+                    if req_recipe == POWERSHELL_SCRIPT_WORK_RECIPE {
+                        return Err(BridgeError::new(
+                            ErrorCode::BridgePolicyDenied,
+                            "POWERSHELL_SCRIPT_WORK_UNSUPPORTED: recipe 'powershell_script_work' is not supported.",
+                            OriginLayer::Policy,
+                        ));
+                    }
                     let pro_review_output = matches!(recipe_permission, RecipePermission::RunOutput)
                         && grant.permitted_categories == PRO_REVIEW_CATEGORIES
                         && grant.writable_paths == [PRO_REVIEW_WRITABLE_PATH]
                         && grant.allowed_recipes == PRO_REVIEW_RECIPES;
-                    if !pro_review_output && !grant.allowed_recipes.iter().any(|r| r == req_recipe) {
+                    let pro_agent_output = matches!(recipe_permission, RecipePermission::RunOutput)
+                        && grant.permitted_categories == PRO_AGENT_CATEGORIES
+                        && grant.writable_paths == [PRO_REVIEW_WRITABLE_PATH]
+                        && grant.allowed_recipes == PRO_AGENT_RECIPES;
+                    let pro_profile_output = pro_review_output || pro_agent_output;
+                    if !pro_profile_output && !grant.allowed_recipes.iter().any(|r| r == req_recipe) {
                         return Err(BridgeError::new(
                             ErrorCode::BridgePolicyDenied,
                             format!("Recipe '{req_recipe}' is not allowed by grant '{}'.", grant.grant_id),
+                            OriginLayer::Policy,
+                        ));
+                    }
+                    if req_recipe == PYTHON_TESTS_WORK_RECIPE
+                        && !matches!(recipe_permission, RecipePermission::RunOutput)
+                        && (!grant.permitted_categories.contains(&OperationCategory::WorkArea)
+                            || grant.writable_paths != [PRO_REVIEW_WRITABLE_PATH])
+                    {
+                        return Err(BridgeError::new(
+                            ErrorCode::BridgePolicyDenied,
+                            "Recipe 'python_tests_work' requires a grant with OperationCategory::WorkArea and writable_paths == [\"_pro/**\"].",
                             OriginLayer::Policy,
                         ));
                     }
@@ -328,6 +456,230 @@ impl<'a> PolicyEngine<'a> {
             )
         })
     }
+}
+
+/// Validate a workspace name under `_pro/work/<workspace>/`.
+///
+/// Must match `^[a-z0-9][a-z0-9_-]{0,39}$`, pass `validate_remote_relative_path`
+/// (blocking traversal, backslashes, colons, reserved Windows device names, and short names),
+/// and not be a hidden/secret name or internal patch staging name.
+pub fn validate_work_name(name: &str) -> Result<(), BridgeError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 40 {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "Workspace name must be 1 to 40 ASCII characters matching ^[a-z0-9][a-z0-9_-]{0,39}$.",
+            OriginLayer::Policy,
+        ));
+    }
+    let first_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
+    let rest_ok = bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_');
+    if !first_ok || !rest_ok {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "Workspace name must start with a lowercase ASCII letter or digit and contain only [a-z0-9_-].",
+            OriginLayer::Policy,
+        ));
+    }
+    let parts = validate_remote_relative_path(name).map_err(|_| {
+        BridgeError::new(
+            ErrorCode::InvalidArgument,
+            format!("Workspace name '{name}' is not a permitted path component."),
+            OriginLayer::Policy,
+        )
+    })?;
+    if parts.len() != 1 || parts[0] != name {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            format!("Workspace name '{name}' must be a single path component."),
+            OriginLayer::Policy,
+        ));
+    }
+    if is_patch_stage_name(name) || is_hidden_from_remote(&parts) {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            format!("Workspace name '{name}' is reserved or hidden from remote principals."),
+            OriginLayer::Policy,
+        ));
+    }
+    Ok(())
+}
+
+/// Strictly validate an optional single-test selector for `python_tests_work` and return its
+/// canonical dotted Python unittest target (`tests.test_<name>[.<Class>[.<method>]]`).
+///
+/// Allowed input forms:
+/// - `tests/test_<name>.py` (single forward slash, exact lowercase `tests/` and `.py`, ASCII `[A-Za-z0-9_]+` after `test_`)
+/// - `tests.test_<name>[.<Class>[.<method>]]` (2..=4 dot-separated ASCII identifier parts)
+///
+/// Rejects option-like values starting with `-`, `..`, backslashes, extra path separators,
+/// whitespace, short names, non-ASCII characters, and overly long selectors (>128 bytes).
+pub fn validate_work_test_selector(selector: &str) -> Result<String, BridgeError> {
+    let invalid = || {
+        BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "Invalid python_tests_work test selector; expected 'tests/test_<name>.py' or 'tests.test_<name>[.<Class>[.<method>]]'.",
+            OriginLayer::Validation,
+        )
+    };
+    if selector.is_empty()
+        || selector.len() > 128
+        || !selector.is_ascii()
+        || selector.starts_with('-')
+        || selector.contains("..")
+        || selector.contains('\\')
+        || selector.contains(':')
+        || selector.contains('~')
+        || selector.bytes().any(|b| b <= 0x20 || b == 0x7f)
+    {
+        return Err(invalid());
+    }
+    let valid_test_stem = |stem: &str| -> bool {
+        stem.strip_prefix("test_").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    };
+    let valid_ident = |ident: &str| -> bool {
+        let bytes = ident.as_bytes();
+        bytes.first().is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    };
+
+    if selector.contains('/') {
+        let parts: Vec<&str> = selector.split('/').collect();
+        if parts.len() != 2 || parts[0] != "tests" {
+            return Err(invalid());
+        }
+        let Some(stem) = parts[1].strip_suffix(".py") else {
+            return Err(invalid());
+        };
+        if !valid_test_stem(stem) {
+            return Err(invalid());
+        }
+        let path_parts = vec!["tests".to_string(), parts[1].to_string()];
+        if is_hidden_from_remote(&path_parts) {
+            return Err(BridgeError::new(
+                ErrorCode::BridgePolicyDenied,
+                "Access to protected secret/credential path is denied.",
+                OriginLayer::Policy,
+            ));
+        }
+        return Ok(format!("tests.{stem}"));
+    }
+
+    let parts: Vec<&str> = selector.split('.').collect();
+    if !(2..=4).contains(&parts.len()) || parts[0] != "tests" || !valid_test_stem(parts[1]) {
+        return Err(invalid());
+    }
+    for ident in &parts[2..] {
+        if !valid_ident(ident) {
+            return Err(invalid());
+        }
+    }
+    let mod_file = format!("{}.py", parts[1]);
+    if is_hidden_from_remote(&["tests".to_string(), mod_file]) {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            "Access to protected secret/credential path is denied.",
+            OriginLayer::Policy,
+        ));
+    }
+    Ok(selector.to_string())
+}
+
+/// Validate `python_tests_work` arguments: `[workspace]` or `[workspace, selector]`.
+/// Returns `(workspace, Option<canonical_dotted_test_target>)`.
+pub fn validate_work_exec_args(args: &[String]) -> Result<(String, Option<String>), BridgeError> {
+    match args {
+        [workspace] => {
+            validate_work_name(workspace)?;
+            Ok((workspace.clone(), None))
+        }
+        [workspace, selector] => {
+            validate_work_name(workspace)?;
+            let canonical = validate_work_test_selector(selector)?;
+            Ok((workspace.clone(), Some(canonical)))
+        }
+        _ => Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "Recipe 'python_tests_work' requires [workspace] or [workspace, test_selector].",
+            OriginLayer::Validation,
+        )),
+    }
+}
+
+/// Returns true iff `normalized_path` is a valid, non-hidden remote relative file path strictly
+/// inside exact-case `_pro/work/<workspace>/<subpath>`. Never folds case: any non-lowercase
+/// `_pro` or `work` component is refused.
+pub fn is_pro_work_file_path(normalized_path: &str) -> bool {
+    let Ok(parts) = validate_remote_relative_path(normalized_path) else {
+        return false;
+    };
+    parts.len() >= 4
+        && parts[0] == "_pro"
+        && parts[1] == "work"
+        && validate_work_name(&parts[2]).is_ok()
+        && !is_hidden_from_remote(&parts)
+}
+
+fn validate_work_area_parts(
+    parts: &[String],
+    allow_workspace_root: bool,
+) -> Result<String, BridgeError> {
+    if parts.is_empty() {
+        return Err(BridgeError::new(
+            ErrorCode::InvalidArgument,
+            "A WorkArea operation cannot target the project root.",
+            OriginLayer::Policy,
+        ));
+    }
+    if is_hidden_from_remote(parts) {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            "Access to protected secret/credential path is denied.",
+            OriginLayer::Policy,
+        )
+        .with_next_action(
+            "Protected secret and credential paths cannot be accessed remotely even with a grant; choose a non-protected project path.",
+        ));
+    }
+    let path = parts.join("/");
+    if is_pro_inbox_path(&path) {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            format!("WorkArea path '{path}' is denied because _pro/inbox/ is read-only for delegated principals."),
+            OriginLayer::Policy,
+        )
+        .with_next_action(
+            "The _pro/inbox/ folder holds requests from local agents and is read-only for delegated principals. Work-area mutations are permitted only inside exact-case _pro/work/<workspace>/**.",
+        ));
+    }
+    // Exact-case rule: refuse any non-lowercase `_pro` or `work` spelling; never fold case.
+    if parts.len() < 3 || parts[0] != "_pro" || parts[1] != "work" {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            format!("WorkArea path '{path}' is denied; mutations are permitted only inside exact-case '_pro/work/<workspace>/**'."),
+            OriginLayer::Policy,
+        ));
+    }
+    validate_work_name(&parts[2])?;
+    if !allow_workspace_root && parts.len() < 4 {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            format!("WorkArea path '{path}' must target a file strictly inside '_pro/work/{}/'.", parts[2]),
+            OriginLayer::Policy,
+        ));
+    }
+    if !allow_workspace_root && !is_pro_work_file_path(&path) {
+        return Err(BridgeError::new(
+            ErrorCode::BridgePolicyDenied,
+            format!("WorkArea path '{path}' is outside '_pro/work/<workspace>/**'."),
+            OriginLayer::Policy,
+        ));
+    }
+    Ok(path)
 }
 
 /// Reject internal stage names and Windows short names before resolving a remote path.
@@ -415,8 +767,12 @@ pub fn folder_is_grant_writable(normalized_folder: &str, patterns: &[String]) ->
 /// A run executes project files, so a grant that may also write project files could run what its
 /// holder wrote. Only a grant with no write access, or one confined to the review folder, may queue.
 pub fn grant_may_queue_runs(grant: &TaskGrantEnvelope) -> Result<(), BridgeError> {
-    let writes = grant.permitted_categories.iter()
-        .any(|category| matches!(category, OperationCategory::Write | OperationCategory::Patch));
+    let writes = grant.permitted_categories.iter().any(|category| {
+        matches!(
+            category,
+            OperationCategory::Write | OperationCategory::Patch | OperationCategory::WorkArea
+        )
+    });
     if writes && grant.writable_paths != [PRO_REVIEW_WRITABLE_PATH] {
         return Err(BridgeError::new(ErrorCode::BridgePolicyDenied,
             "This grant can write project files, so it cannot queue a run. Use a grant whose only writable path is the review folder.",
@@ -843,5 +1199,554 @@ mod tests {
         ] {
             assert!(!none_err.message.contains(gid), "error leaked grant id {gid}");
         }
+    }
+
+    #[test]
+    fn validate_work_name_and_is_pro_work_file_path_enforce_exact_case_and_block_hazards() {
+        let max_len = "a".repeat(40);
+        let over_len = "a".repeat(41);
+        for valid in ["a", "0", "fix-1", "ws_01", "a0-b_9", max_len.as_str()] {
+            assert!(validate_work_name(valid).is_ok(), "expected valid workspace name {valid:?}");
+        }
+
+        // Empty, over-long, uppercase, bad leading/inner characters, traversal, short names, device names.
+        for invalid in [
+            "",
+            over_len.as_str(),
+            "FIX",
+            "Fix-1",
+            "aB",
+            "-fix",
+            "_fix",
+            "fix.1",
+            "fix 1",
+            "fix/1",
+            r"fix\1",
+            "fix:1",
+            "..",
+            ".",
+            "work~1",
+            "WORK~1",
+            "café",
+            "con",
+            "nul",
+            "prn",
+            "aux",
+            "com1",
+            "lpt9",
+        ] {
+            let err = validate_work_name(invalid).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "workspace {invalid:?}");
+        }
+
+        // Hidden/secret names matching the character set are refused with BridgePolicyDenied.
+        for hidden in ["id_rsa", "id_ed25519", "cookies", "kubeconfig", "api-token"] {
+            let err = validate_work_name(hidden).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BridgePolicyDenied, "hidden workspace {hidden:?}");
+        }
+
+        // Valid exact-case file paths inside _pro/work/<workspace>/**.
+        for ok_path in [
+            "_pro/work/fix-1/a.py",
+            "_pro/work/ws_01/src/sub/mod.rs",
+            "_pro/work/0/README.md",
+            &format!("_pro/work/{max_len}/file.txt"),
+        ] {
+            assert!(is_pro_work_file_path(ok_path), "expected valid work file path {ok_path:?}");
+        }
+
+        // Denied paths: workspace root itself, non-work _pro paths, live project paths,
+        // traversal, backslash, colon/ADS, leading slash, 8.3 short names, wrong case of `_pro` or `work`,
+        // bad workspace names, hidden/staging files, and Windows device names.
+        let over_len_path = format!("_pro/work/{over_len}/a.py");
+        for bad_path in [
+            "_pro/work/fix-1",
+            "_pro/work/fix-1/",
+            "_pro/work",
+            "_pro",
+            "_pro/inbox/a.md",
+            "_pro/outbox/a.md",
+            "_pro/reports/a.md",
+            "_pro/notes.md",
+            "src/a.py",
+            "_pro/work/fix-1/../outbox/a.py",
+            "_pro/work/../src/a.py",
+            "_pro/work/fix-1/a/../b.py",
+            r"_pro\work\fix-1\a.py",
+            r"_pro/work/fix-1/a\b.py",
+            "_pro/work/fix-1/a.py:stream",
+            "C:_pro/work/fix-1/a.py",
+            "_pro/work/fix:1/a.py",
+            "/_pro/work/fix-1/a.py",
+            "_PRO~1/work/fix-1/a.py",
+            "_pro/WORK~1/fix-1/a.py",
+            "_pro/work/WORK~1/a.py",
+            "_pro/work/fix-1/SUB~1/a.py",
+            "_PRO/work/fix-1/a.py",
+            "_Pro/work/fix-1/a.py",
+            "_pro/WORK/fix-1/a.py",
+            "_pro/Work/fix-1/a.py",
+            "_PRO/WORK/fix-1/a.py",
+            "_pro/work//a.py",
+            over_len_path.as_str(),
+            "_pro/work/FIX/a.py",
+            "_pro/work/-bad/a.py",
+            "_pro/work/con/a.py",
+            "_pro/work/id_rsa/a.py",
+            "_pro/work/fix-1/.env",
+            "_pro/work/fix-1/.git/config",
+            "_pro/work/fix-1/auth.json",
+            "_pro/work/fix-1/.eb_stage_123",
+            "_pro/work/fix-1/con.py",
+            "_pro/work/fix-1/nul",
+        ] {
+            assert!(!is_pro_work_file_path(bad_path), "expected rejection for {bad_path:?}");
+        }
+    }
+
+    #[test]
+    fn pro_agent_work_area_policy_rules_preserve_pro_review_and_edge_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("state.sqlite3")).unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let proj = store.register_project(&root, "AgentProj", "ntfs:2:1").unwrap();
+        let proj = store.grant_edge_readonly(&proj.project_id).unwrap();
+        let host = HostId::parse("host_local20").unwrap();
+        let other_host = HostId::parse("host_other99").unwrap();
+        let policy = PolicyEngine::new(&store, host.clone());
+        let exec = Principal::DelegatedExecutor("default".to_string());
+
+        let create_grant = |cats: Vec<OperationCategory>,
+                            writable_paths: Vec<String>,
+                            recipes: Vec<String>,
+                            host_id: HostId,
+                            rev: u64,
+                            expires_offset_mins: i64| {
+            let g = TaskGrantEnvelope {
+                grant_id: GrantId::new_random(),
+                requester_principal: exec.as_db_key(),
+                granting_owner: "local_owner".to_string(),
+                host_id,
+                project_id: ProjectId(proj.project_id.clone()),
+                workspace_id: WorkspaceId::new_random(),
+                baseline_hash: "sha256:0000".to_string(),
+                policy_revision: rev,
+                permitted_categories: cats,
+                writable_paths,
+                allowed_recipes: recipes,
+                network_destinations: Vec::new(),
+                export_scope: "redacted_summary".to_string(),
+                integration_mode: IntegrationMode::AwaitOwnerReview,
+                limits: ResourceLimits::default(),
+                offline_policy: OfflineGrantPolicy::DenyNewAllowRunningDeterministic,
+                expires_at: Utc::now() + Duration::minutes(expires_offset_mins),
+                revoked: false,
+                revoked_at: None,
+                created_at: Utc::now(),
+            };
+            store.create_task_grant(&g).unwrap();
+            g
+        };
+
+        let review_grant = create_grant(
+            PRO_REVIEW_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_REVIEW_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let agent_grant = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let legacy_ps_grant = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            vec![
+                "python_tests".to_owned(),
+                "powershell_script".to_owned(),
+                PYTHON_TESTS_WORK_RECIPE.to_owned(),
+                POWERSHELL_SCRIPT_WORK_RECIPE.to_owned(),
+            ],
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let work_recipe_without_work_area = create_grant(
+            vec![
+                OperationCategory::Read,
+                OperationCategory::GitRead,
+                OperationCategory::ExecuteRecipe,
+            ],
+            Vec::new(),
+            vec![PYTHON_TESTS_WORK_RECIPE.to_owned()],
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let legacy_patch_grant = create_grant(
+            vec![
+                OperationCategory::Read,
+                OperationCategory::GitRead,
+                OperationCategory::Write,
+                OperationCategory::Patch,
+                OperationCategory::ExecuteRecipe,
+            ],
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_REVIEW_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let broad_work_grant = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec!["**".to_owned()],
+            PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let src_work_grant = create_grant(
+            vec![OperationCategory::Read, OperationCategory::WorkArea],
+            vec!["src/**".to_owned()],
+            vec!["python_tests".to_owned()],
+            host.clone(),
+            proj.policy_revision,
+            30,
+        );
+        let expired_agent = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision,
+            -5,
+        );
+        let wrong_host_agent = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            other_host,
+            proj.policy_revision,
+            30,
+        );
+        let stale_rev_agent = create_grant(
+            PRO_AGENT_CATEGORIES.to_vec(),
+            vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+            PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+            host.clone(),
+            proj.policy_revision + 1,
+            30,
+        );
+
+        // Positive: pro-agent authorizes work-area file and workspace mutations, commit re-check,
+        // python_tests_work recipe, and job_output.
+        let file_dec = policy
+            .authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("src/a.py"), Some(&agent_grant.grant_id.0))
+            .unwrap();
+        assert_eq!(file_dec.normalized_write_path.as_deref(), Some("_pro/work/fix-1/src/a.py"));
+        assert_eq!(file_dec.grant_id.as_ref(), Some(&agent_grant.grant_id));
+
+        let ws_dec = policy
+            .authorize_work_mutation(&exec, &proj.project_id, "fix-1", None, Some(&agent_grant.grant_id.0))
+            .unwrap();
+        assert_eq!(ws_dec.normalized_write_path.as_deref(), Some("_pro/work/fix-1"));
+
+        policy
+            .authorize_write_commit(&exec, &proj.project_id, OperationCategory::WorkArea, "_pro/work/fix-1/src/a.py", &agent_grant.grant_id.0)
+            .unwrap();
+        policy
+            .authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("python_tests_work"), Some(&agent_grant.grant_id.0))
+            .unwrap();
+        assert_eq!(
+            policy
+                .authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("powershell_script_work"), Some(&agent_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+        // Even if a stored grant lists powershell_script_work, it is always refused.
+        let ps_err = policy
+            .authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("powershell_script_work"), Some(&legacy_ps_grant.grant_id.0))
+            .unwrap_err();
+        assert_eq!(ps_err.code, ErrorCode::BridgePolicyDenied);
+        assert!(ps_err.message.contains("POWERSHELL_SCRIPT_WORK_UNSUPPORTED"));
+        // A grant listing python_tests_work without OperationCategory::WorkArea and writable_paths == ["_pro/**"] is refused.
+        assert_eq!(
+            policy
+                .authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("python_tests_work"), Some(&work_recipe_without_work_area.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+        policy.authorize_run_output(&exec, &proj.project_id, Some(&agent_grant.grant_id.0)).unwrap();
+        assert_eq!(
+            policy
+                .authorize_run_output(&exec, &proj.project_id, Some(&legacy_ps_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy
+                .authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("read_output"), Some(&agent_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert!(grant_may_queue_runs(&agent_grant).is_ok());
+        assert!(grant_may_queue_runs(&legacy_ps_grant).is_ok());
+
+        // Negative: edge gains nothing.
+        assert_eq!(
+            policy.authorize_work_mutation(&Principal::Edge, &proj.project_id, "fix-1", Some("a.py"), None).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize_work_mutation(&Principal::Edge, &proj.project_id, "BAD!", Some("a.py"), None).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize(&Principal::Edge, &proj.project_id, OperationCategory::WorkArea, Some("_pro/work/fix-1/a.py"), None, None).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize(&Principal::Edge, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("python_tests_work"), None).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+
+        // Negative: pro-review and legacy grants behave strictly as before.
+        assert_eq!(
+            policy.authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("a.py"), Some(&review_grant.grant_id.0)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize(&exec, &proj.project_id, OperationCategory::ExecuteRecipe, None, Some("python_tests_work"), Some(&review_grant.grant_id.0)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        policy.authorize_run_output(&exec, &proj.project_id, Some(&review_grant.grant_id.0)).unwrap();
+        assert_eq!(
+            policy.authorize_run_output(&exec, &proj.project_id, Some(&legacy_patch_grant.grant_id.0)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+
+        // Negative: WorkArea requires writable_paths == ["_pro/**"], and grant_may_queue_runs rejects broader WorkArea grants.
+        for bad_grant in [&broad_work_grant, &src_work_grant] {
+            assert_eq!(
+                policy.authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("a.py"), Some(&bad_grant.grant_id.0)).unwrap_err().code,
+                ErrorCode::BridgePolicyDenied
+            );
+            assert_eq!(grant_may_queue_runs(bad_grant).unwrap_err().code, ErrorCode::BridgePolicyDenied);
+            assert_eq!(
+                policy.authorize_run_output(&exec, &proj.project_id, Some(&bad_grant.grant_id.0)).unwrap_err().code,
+                ErrorCode::BridgePolicyDenied
+            );
+        }
+
+        // Negative: expired, wrong host, stale policy_revision.
+        assert_eq!(
+            policy.authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("a.py"), Some(&expired_agent.grant_id.0)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("a.py"), Some(&wrong_host_agent.grant_id.0)).unwrap_err().code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy.authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("a.py"), Some(&stale_rev_agent.grant_id.0)).unwrap_err().code,
+            ErrorCode::StalePrecondition
+        );
+
+        // Negative: pro-agent still refuses _pro/inbox and outside-_pro paths for Write and Patch.
+        for cat in [OperationCategory::Write, OperationCategory::Patch] {
+            for denied in ["_pro/inbox/a.md", "_pro/INBOX/a.md", "src/a.py", "outside.txt", "_PRO/work/fix-1/a.py"] {
+                assert_eq!(
+                    policy.authorize(&exec, &proj.project_id, cat, Some(denied), None, Some(&agent_grant.grant_id.0)).unwrap_err().code,
+                    ErrorCode::BridgePolicyDenied,
+                    "{cat:?} {denied}"
+                );
+            }
+        }
+
+        // Negative: direct WorkArea authorization refuses everything outside exact-case _pro/work/<valid>/<file>.
+        for denied in [
+            "_pro/inbox/a.md",
+            "_pro/outbox/a.md",
+            "_pro/reports/a.md",
+            "_pro/notes.md",
+            "_pro/work/fix-1",
+            "_PRO/work/fix-1/a.py",
+            "_pro/WORK/fix-1/a.py",
+            "_pro/Work/fix-1/a.py",
+            "src/a.py",
+            "_pro/work/fix-1/.env",
+            "_pro/work/fix-1/.git/config",
+            "_pro/work/WORK~1/a.py",
+            "_pro/work/fix-1/SUB~1/a.py",
+        ] {
+            assert_eq!(
+                policy
+                    .authorize(&exec, &proj.project_id, OperationCategory::WorkArea, Some(denied), None, Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::BridgePolicyDenied,
+                "WorkArea {denied}"
+            );
+        }
+        for traversal in [
+            "_pro/work/fix-1/../outbox/a.py",
+            "_pro/work/../src/a.py",
+            r"_pro\work\fix-1\a.py",
+            "_pro/work/fix-1/a.py:stream",
+            "/_pro/work/fix-1/a.py",
+        ] {
+            assert_eq!(
+                policy
+                    .authorize(&exec, &proj.project_id, OperationCategory::WorkArea, Some(traversal), None, Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::PathOutsideRoot,
+                "WorkArea {traversal}"
+            );
+        }
+        assert_eq!(
+            policy
+                .authorize(&exec, &proj.project_id, OperationCategory::WorkArea, Some("_pro/work/FIX/a.py"), None, Some(&agent_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            policy
+                .authorize(&exec, &proj.project_id, OperationCategory::WorkArea, Some("_pro/work/con/a.py"), None, Some(&agent_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsupportedPathType
+        );
+
+        // Negative: authorize_work_mutation rejects bad workspace names and bad subpaths.
+        for bad_ws in ["", &"a".repeat(41), "FIX", "-bad", "_bad", "con", "nul", "com1", "..", "a/b", r"a\b", "a:b", "WORK~1"] {
+            assert_eq!(
+                policy
+                    .authorize_work_mutation(&exec, &proj.project_id, bad_ws, Some("a.py"), Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidArgument,
+                "bad_ws {bad_ws:?}"
+            );
+        }
+        for bad_sub in ["", "."] {
+            assert_eq!(
+                policy
+                    .authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some(bad_sub), Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidArgument,
+                "bad_sub {bad_sub:?}"
+            );
+        }
+        for bad_sub_path in ["../outbox/a.py", r"a\b.py", "a.py:stream", "/a.py"] {
+            assert_eq!(
+                policy
+                    .authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some(bad_sub_path), Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::PathOutsideRoot,
+                "bad_sub_path {bad_sub_path:?}"
+            );
+        }
+        for denied_sub in ["SUB~1/a.py", ".env", ".git/config", ".eb_stage_1"] {
+            assert_eq!(
+                policy
+                    .authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some(denied_sub), Some(&agent_grant.grant_id.0))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::BridgePolicyDenied,
+                "denied_sub {denied_sub:?}"
+            );
+        }
+
+        // Revoking the pro-agent grant immediately blocks both authorize_work_mutation and commit re-check.
+        store.revoke_task_grant(&agent_grant.grant_id.0).unwrap();
+        assert_eq!(
+            policy
+                .authorize_work_mutation(&exec, &proj.project_id, "fix-1", Some("src/a.py"), Some(&agent_grant.grant_id.0))
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+        assert_eq!(
+            policy
+                .authorize_write_commit(&exec, &proj.project_id, OperationCategory::WorkArea, "_pro/work/fix-1/src/a.py", &agent_grant.grant_id.0)
+                .unwrap_err()
+                .code,
+            ErrorCode::BridgePolicyDenied
+        );
+    }
+
+    #[test]
+    fn work_test_selector_accepts_canonical_forms_and_rejects_injection_and_traversal() {
+        for (raw, expected) in [
+            ("tests/test_calc.py", "tests.test_calc"),
+            ("tests/test_123_abc.py", "tests.test_123_abc"),
+            ("tests.test_calc", "tests.test_calc"),
+            ("tests.test_calc.CalcTests", "tests.test_calc.CalcTests"),
+            ("tests.test_calc.CalcTests.test_add", "tests.test_calc.CalcTests.test_add"),
+        ] {
+            assert_eq!(validate_work_test_selector(raw).unwrap(), expected, "{raw}");
+        }
+        for bad in [
+            "",
+            "-c",
+            "-v",
+            "--help",
+            "-m",
+            "tests/test_.py",
+            "tests/calc.py",
+            "tests/TEST_calc.py",
+            "tests/test_calc.PY",
+            "TESTS/test_calc.py",
+            "tests/sub/test_calc.py",
+            "tests/../test_calc.py",
+            "../tests/test_calc.py",
+            "/tests/test_calc.py",
+            r"tests\test_calc.py",
+            "tests/test_calc.py ",
+            "tests/test_calc.py;id",
+            "tests/test~1.py",
+            "tests/test_calc.py:ads",
+            "tests.test_",
+            "tests..test_calc",
+            "tests.test_calc.",
+            ".tests.test_calc",
+            "os.system",
+            "tests.calc",
+            "tests.test_calc.1BadClass",
+            "tests.test_calc.Class.method.extra",
+            "tests.test_calc.-flag",
+            &format!("tests.test_{}", "a".repeat(120)),
+        ] {
+            assert_eq!(
+                validate_work_test_selector(bad).unwrap_err().code,
+                ErrorCode::InvalidArgument,
+                "expected InvalidArgument for {bad:?}"
+            );
+        }
+        assert_eq!(
+            validate_work_exec_args(&["fix-1".into(), "tests/test_a.py".into()]).unwrap(),
+            ("fix-1".into(), Some("tests.test_a".into()))
+        );
+        assert_eq!(
+            validate_work_exec_args(&["fix-1".into()]).unwrap(),
+            ("fix-1".into(), None)
+        );
+        assert!(validate_work_exec_args(&[]).is_err());
+        assert!(validate_work_exec_args(&["fix-1".into(), "tests/test_a.py".into(), "extra".into()]).is_err());
     }
 }

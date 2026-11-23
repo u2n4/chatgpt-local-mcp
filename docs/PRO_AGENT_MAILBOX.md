@@ -2,7 +2,7 @@
 
 The web model (ChatGPT with Pro effort) works with the local AI agents through files in the project, not through the web chat. Its findings can be large, and the agents that act on them run on this machine. The chat only carries a short pointer to what was written.
 
-This document is the protocol for both sides. It needs the `executor` connection with a `pro-review` grant (see `docs/REMOTE_EXECUTOR.md`). The read-only `edge` connection cannot write and does not take part.
+This document is the protocol for both sides. It needs the `executor` connection with either a `pro-review` grant (create-only review and mailbox) or a `pro-agent` grant (adds mutable workspaces under `_pro/work/<workspace>/` and diff export; see `docs/REMOTE_EXECUTOR.md`). The read-only `edge` connection cannot write and does not take part.
 
 ## Folders
 
@@ -11,10 +11,11 @@ All paths are relative to the project root.
 | Folder | Written by | Read by | Content |
 | --- | --- | --- | --- |
 | `_pro/inbox/` | Local agents, owner | Pro | Requests for Pro: what to review, test or answer |
-| `_pro/outbox/` | Pro | Local agents, owner | Short replies and findings, one message per file |
+| `_pro/outbox/` | Pro | Local agents, owner | Short replies, findings, and exported `.diff` files (`work_export_diff`) |
 | `_pro/reports/` | Pro | Local agents, owner | Long reports that a message points to |
+| `_pro/work/<workspace>/` | Pro (`pro-agent` grant only) | Pro, owner | Isolated editable copies of project files (`work_copy`, `work_edit`, `work_move`, `work_delete`, `work_diff`) |
 
-Pro's grant allows create-only writes under `_pro/**`. Under any grant, a delegated principal can never create or patch files under `_pro/inbox/`, and cannot change or delete any existing file, including its own earlier messages. It can read `_pro/inbox/`. Write replies under `_pro/outbox/` and reports under `_pro/reports/`; a correction is a new message.
+Under `pro-review`, Pro's grant allows create-only writes under `_pro/**`: it cannot change or delete any existing file, including its own earlier messages, and none of the `work_*` tools is available. Under `pro-agent`, Pro can additionally copy, edit, move, and delete files strictly inside exact-case `_pro/work/<workspace>/` (up to 16 workspaces), compare them with `work_diff`, and export a create-only `.diff` file to `_pro/outbox/` with `work_export_diff`. Under every grant, `_pro/inbox/` is strictly read-only for delegated principals, `_pro/outbox/` and `_pro/reports/` stay create-only, and live project files outside `_pro/work/` stay read-only. Write replies under `_pro/outbox/` and reports under `_pro/reports/`; a correction is a new message.
 
 ## File names
 
@@ -47,11 +48,13 @@ Body in Markdown.
 
 ## What Pro does
 
-1. List `_pro/inbox/` and `_pro/outbox/`. A request is open when no outbox message has its `id` in `reply_to`.
-2. Read the files the request names. Every read returns the file as it is on disk at that moment; nothing is cached.
-3. To run tests or a PowerShell script, submit a run with `task_submit` and read the result with `job_get` and `job_output`. Runs execute on a copy of the project inside the sandbox with the network off. They cannot change the project.
-4. Write the reply to `_pro/outbox/`, and a long report to `_pro/reports/`.
-5. In the web chat, answer with the path of the reply and the `RESULT` line only.
+1. Call `project_list`, then `policy_view` (`grant_id` may be omitted) to check the active grant profile (`work_area` present for `pro-agent`, absent for `pro-review`), limits, allowed recipes, and existing workspaces.
+2. List `_pro/inbox/` and `_pro/outbox/`. A request is open when no outbox message has its `id` in `reply_to`.
+3. Read the files the request names (prefer `file_read_batch`, `start_line`/`end_line`, and `file_search` with `context_lines`, `file_glob`, `regex`). Every read returns the file as it is on disk at that moment; nothing is cached.
+4. Under `pro-agent`, to prepare a code change: `work_copy` the needed project files into `_pro/work/<workspace>/`, edit them with `work_edit` (several files in one call; or `work_move`/`work_delete`), inspect with `work_diff`, run tests if enabled, repeat until done, then export the patch with `work_export_diff` to `_pro/outbox/<name>.diff`.
+5. To run tests or a PowerShell script, submit a background run with `task_submit` (returns `run_id` immediately; keep reading or editing) and collect up to 16 runs with `job_wait` (up to 20 seconds, includes bounded output; use `job_output` for more). Standard `python_tests` and `powershell_script` run project files only, never `_pro/work/`. `python_tests_work` runs `_pro/work/<workspace>/` only when the owner started the worker with `--allow-work-exec`; if refused with `WORK_EXEC_NOT_ENABLED`, do not retry—export the diff and note in the report that the change was not tested. Only standard-library `unittest` runs (no third-party packages), for at most 60 seconds.
+6. Write the reply to `_pro/outbox/`, and a long report to `_pro/reports/`.
+7. In the web chat, answer with the path of the reply (and exported `.diff`, if any) and the `RESULT` line only.
 
 ## What a local agent does
 
@@ -67,17 +70,21 @@ Body in Markdown.
 ## Owner setup
 
 - Keep `_pro/` out of version control: add `_pro/` to `.git/info/exclude` in the project.
-- Create the grant with `edge-bridge grant-create <project-id> --profile pro-review`. It expires after 60 minutes by default. (Bare `grant-create` without `--profile` or `--writable-path` grants `read`, `git_read` and `execute_recipe` for the requested `--recipe` values, default `python_tests`, and no writable path; an explicit `--writable-path` also adds `write`, `patch` and `checkpoint`.)
+- Create the grant with either:
+  - `edge-bridge --state-dir <state> grant-create <project_id> --profile pro-review` (review and create-only mailbox under `_pro/**`, `python_tests` and `powershell_script`), or
+  - `edge-bridge --state-dir <state> grant-create <project_id> --profile pro-agent` (adds `work_area` editing under `_pro/work/<workspace>/`, `work_diff`/`work_export_diff`, and `python_tests_work`).
+  Grants expire after 60 minutes by default (`--ttl-minutes 1..1440`). Bare `grant-create` without `--profile` or `--writable-path` grants `read`, `git_read` and `execute_recipe` for the requested `--recipe` values (default `python_tests`) and no writable path; an explicit `--writable-path` also adds `write`, `patch` and `checkpoint`.
 - `grant-revoke` stops new calls under that grant. Reads already authorized and recipe jobs already running can finish. Queued or admitted jobs that have yet to start are blocked at worker start.
-- Start the worker that executes queued runs: `edge-bridge worker --runtime-root <trusted checkout>`. Without it, runs stay queued.
-- Run `edge-bridge environment-check` first. A run can read the user and machine environment variables that Windows keeps in the registry, and its output goes back to Pro. While any of them looks like a credential, the worker fails each run with `PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS`. Move those variables out of the persistent environment. `--allow-environment-credentials` on the worker runs anyway and accepts that Pro can read them.
+- Start the worker that executes queued runs: `edge-bridge --state-dir <state> worker --runtime-root <trusted-checkout>`. Without it, runs stay queued. Leave `--allow-work-exec` off unless you explicitly accept that remote-authored `python_tests_work` code can read `HKCU\Software`, `HKLM\Software`, `HKCU\Environment`, and your Windows user name/profile paths (see `docs/KNOWN_LIMITATIONS.md`).
+- Run `edge-bridge --state-dir <state> environment-check` first. A run can read the user and machine environment variables that Windows keeps in the registry, and its output goes back to Pro. While any of them looks like a credential, the worker fails each run with `PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS`. Move those variables out of the persistent environment. `--allow-environment-credentials` on the worker applies to standard recipes only and never unlocks `python_tests_work`.
+- To apply a `pro-agent` workspace locally: preview with `edge-bridge --state-dir <state> work-apply <project_id> <workspace>`, apply atomically with `--confirm`, and roll back if needed with `edge-bridge --state-dir <state> rollback-patch --project-root <project> --journal-id <journal_id>`.
 
 ## Limits
 
 - Pro sees a request only when it is asked in the web chat to check the inbox. There is no push from the machine to the web model.
-- A run started by Pro waits for the worker. Pro has to poll `job_get`.
-- Nothing inside `_pro/` runs. `powershell_script` refuses a script there with `SCRIPT_INSIDE_REQUESTER_WRITABLE_PATH`, and `python_tests` leaves the folder out of the copy it tests. The same holds for every folder that any grant for the project has ever made writable, including grants that have expired or been revoked. Keep scripts and tests that should run outside those folders.
-- A grant that can write (the write or patch category) can queue a run only when `_pro/**` is its one writable path, spelled exactly so. `--profile pro-review` makes such a grant. Any other writing grant is refused by `task_submit` and again by the worker.
+- A run started by Pro waits for the worker; Pro collects results with `job_wait` (up to 20 seconds per call, up to 16 runs) or `job_get`. A grant may hold at most 8 active or queued runs at once.
+- Standard `python_tests` and `powershell_script` never run anything inside `_pro/`: `powershell_script` refuses a script there with `SCRIPT_INSIDE_REQUESTER_WRITABLE_PATH`, and `python_tests` leaves the folder out of the copy it tests. The same holds for every folder that any grant for the project has ever made writable, including grants that have expired or been revoked. `python_tests_work` runs `_pro/work/<workspace>/` only when the grant is `pro-agent` and the owner explicitly started the worker with `--allow-work-exec`; `powershell_script_work` is refused everywhere.
+- A grant that can write (`write`, `patch`, or `work_area`) can queue a run only when `_pro/**` is its one writable path, spelled exactly so. `--profile pro-review` and `--profile pro-agent` make such grants. Any other writing grant is refused by `task_submit` and again by the worker.
 - If an earlier grant for the project made another folder writable, for example `src/**`, that folder stays out of every later run, so tests that import from it fail. The bridge has no way to clear that history: it cannot tell which files in the folder a reviewer wrote. Do not start a new state directory for a project that had such a grant unless you have checked every file in that folder yourself, because a new state directory forgets the grant and lets those files run.
 - Queued runs need a state directory that holds exactly one registered project. With two or more, `task_submit` still accepts the request and the worker refuses it. Two projects can share files (one folder inside the other, or one folder reached by two names), and the bridge cannot rule that out for every kind of link, share and mount, so it does not try. Give each project that a reviewer may run tests on its own state directory, worker and connection, and keep those projects apart on disk: no project folder inside another, and no folder registered twice under two names. Each state directory knows only its own grants, so a file a reviewer wrote through one instance can run in another that reaches the same folder.
 - A run is refused at launch when a grant or a project was added after its files were chosen. Queue it again.
