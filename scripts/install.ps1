@@ -382,9 +382,9 @@ if ($projectWithSlash.StartsWith($installWithSlash, [System.StringComparison]::O
 
 if ([string]::IsNullOrWhiteSpace($ZipPath) -and [string]::IsNullOrWhiteSpace($Version)) {
     if (-not $interactive) {
-        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.6.0-pre2).'
+        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.6.0-pre3).'
     }
-    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.6.0-pre2)?'
+    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.6.0-pre3)?'
     $cleaned = Remove-OuterQuotes $answer
     if ([string]::IsNullOrWhiteSpace($cleaned)) { throw 'A release version is required when -ZipPath is not supplied.' }
     $Version = $cleaned
@@ -489,11 +489,11 @@ if ($null -eq $python313Path) {
 
 $pwshPinnedPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshPinnedPath -PathType Leaf)) {
-    $missingTestRunPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): not found (needed for PowerShell script runs; install PowerShell-7.7.0-win-x64.msi, not the Microsoft Store app): https://github.com/PowerShell/PowerShell/releases/tag/v7.7.0")
+    $missingTestRunPrereqs.Add("Pinned PowerShell 7.6.10 x64 ($pwshPinnedPath): not found (needed for PowerShell script runs; install PowerShell-7.6.10-win-x64.msi, not the Microsoft Store app): https://github.com/PowerShell/PowerShell/releases/tag/v7.6.10")
 } else {
     $pwshHash = (Get-FileHash -LiteralPath $pwshPinnedPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($pwshHash -ne $PINNED_POWERSHELL_SHA256) {
-        $missingTestRunPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): SHA-256 mismatch (found $pwshHash, expected $PINNED_POWERSHELL_SHA256). Install PowerShell-7.7.0-win-x64.msi: https://github.com/PowerShell/PowerShell/releases/tag/v7.7.0")
+        $missingTestRunPrereqs.Add("Pinned PowerShell 7.6.10 x64 ($pwshPinnedPath): SHA-256 mismatch (found $pwshHash, expected $PINNED_POWERSHELL_SHA256). Install PowerShell-7.6.10-win-x64.msi: https://github.com/PowerShell/PowerShell/releases/tag/v7.6.10")
     }
 }
 
@@ -774,7 +774,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $config.runtime_dir '.venv\Scripts\p
     throw 'uv sync did not create the environment inside the runtime folder.'
 }
 Write-Output 'The worker runtime is built. Run .\start-worker.ps1.'
-Write-Output 'A test run also needs the exact PowerShell 7.7.0 and Codex 0.171.0 builds listed in docs\INSTALL.md.'
+Write-Output 'A test run also needs the exact PowerShell 7.6.10 and Codex 0.171.0 builds listed in docs\INSTALL.md.'
 '@
 
     $newGrantContent = @'
@@ -1080,11 +1080,11 @@ if ($null -eq $python313Path) {
 
 $pwshPinnedPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshPinnedPath -PathType Leaf)) {
-    $missingPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): not found")
+    $missingPrereqs.Add("Pinned PowerShell 7.6.10 x64 ($pwshPinnedPath): not found")
 } else {
     $pwshHash = (Get-FileHash -LiteralPath $pwshPinnedPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($pwshHash -ne $PINNED_POWERSHELL_SHA256) {
-        $missingPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): SHA-256 mismatch")
+        $missingPrereqs.Add("Pinned PowerShell 7.6.10 x64 ($pwshPinnedPath): SHA-256 mismatch")
     }
 }
 

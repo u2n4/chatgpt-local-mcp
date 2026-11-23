@@ -22,7 +22,7 @@ ChatGPT Local MCP connects ChatGPT web, or any MCP client, to one project folder
 | --- | --- |
 | Install, read, copy, edit, diff | Windows 10 or 11 (x64) and [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows) |
 | Git tools | Git for Windows |
-| Test runs | `uv`, Python 3.13, PowerShell `7.7.0` x64 (MSI install) and `@openai/codex@0.171.0`. The installer lists what is missing and does not stop. |
+| Test runs | `uv`, Python 3.13, PowerShell `7.6.10` x64 (MSI install) and `@openai/codex@0.171.0`. The installer lists what is missing and does not stop. |
 | ChatGPT web | An OpenAI Platform organization with Tunnels access, and OpenAI's `tunnel-client` |
 
 ### Install
@@ -31,7 +31,7 @@ Open **PowerShell 7** and run this block. It downloads `install.ps1` and `SHA256
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$version = '0.6.0-pre2'
+$version = '0.6.0-pre3'
 $base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
@@ -114,7 +114,7 @@ When it finishes, preview and apply the change from the install folder:
 - A run lasts at most 60 seconds, and only standard-library `unittest` runs. A project that needs `pytest`, `numpy` or other packages cannot be tested yet.
 - A test run works on a snapshot of at most 128 files, 256 KiB per file and 4 MiB in total. A larger project is refused with `RESOURCE_BUDGET_EXCEEDED`, and the refusal names the limit and the measured value. The tests folder needs no `__init__.py`.
 - The model cannot test its own change by default. `.\start.ps1 -AllowWorkExec` (which prints a warning and asks `y/N` first) or `.\start-worker.ps1 --allow-work-exec` turns that on. Code written by the model then runs in the sandbox on your PC. Measured on one PC: no network and no folder outside the copy, but the code can read your user name, profile paths and the registry keys `HKCU\Software`, `HKLM\Software` and `HKCU\Environment`. Turn it on only when you accept that.
-- Test runs need the exact pinned builds of PowerShell `7.7.0` and `@openai/codex@0.171.0`. The Codex package is used only as the sandbox engine; it needs no OpenAI account and no model. If either build updates, test runs fail until the pins are updated.
+- Test runs need the exact pinned builds of PowerShell `7.6.10` and `@openai/codex@0.171.0`. The Codex package is used only as the sandbox engine; it needs no OpenAI account and no model. If either build updates, test runs fail until the pins are updated.
 - This is a prerelease, tested on one PC. `SHA256SUMS.txt` from the same release detects a damaged download only; it does not prove who published the release.
 
 ### More
@@ -149,7 +149,7 @@ ChatGPT Local MCP يربط ChatGPT web، أو أي MCP client، بمجلد مش�
 | --- | --- |
 | التثبيت، القراءة، النسخ، التعديل، الـ diff | Windows 10 أو 11 (x64) و [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows) |
 | أدوات Git | Git for Windows |
-| تشغيل الاختبارات | `uv` و Python 3.13 و PowerShell `7.7.0` x64 (تثبيت MSI) و `@openai/codex@0.171.0`. المثبّت يذكر الناقص ولا يتوقف. |
+| تشغيل الاختبارات | `uv` و Python 3.13 و PowerShell `7.6.10` x64 (تثبيت MSI) و `@openai/codex@0.171.0`. المثبّت يذكر الناقص ولا يتوقف. |
 | ChatGPT web | حساب OpenAI Platform (organization) فيه صلاحية Tunnels، وبرنامج `tunnel-client` من OpenAI |
 
 ### التثبيت
@@ -158,7 +158,7 @@ ChatGPT Local MCP يربط ChatGPT web، أو أي MCP client، بمجلد مش�
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$version = '0.6.0-pre2'
+$version = '0.6.0-pre3'
 $base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
@@ -241,7 +241,7 @@ and write a short report to _pro/reports/fix1.md.
 - التشغيل الواحد أقصاه 60 ثانية، ويشتغل `unittest` من المكتبة القياسية فقط. مشروع يحتاج `pytest` أو `numpy` أو مكتبات أخرى لا يُختبر حاليًا.
 - تشغيل الاختبارات يعمل على لقطة (snapshot) أقصاها 128 ملفًا و256 KiB للملف و4 MiB بالمجموع. المشروع الأكبر يُرفض بالرمز `RESOURCE_BUDGET_EXCEEDED`، والرفض يذكر الحد والقيمة المقاسة. مجلد الاختبارات لا يحتاج `__init__.py`.
 - الـ model لا يقدر يختبر تعديله هو افتراضيًا. الأمر `.\start.ps1 -AllowWorkExec` (يعرض تحذيرًا ويسأل `y/N` أولًا) أو `.\start-worker.ps1 --allow-work-exec` يفتح ذلك، وعندها يشتغل كود كتبه الـ model داخل الـ sandbox على جهازك. القياس على جهاز واحد: لا شبكة ولا مجلدات خارج النسخة، لكن الكود يقدر يقرأ اسم المستخدم ومسارات الـ profile ومفاتيح السجل `HKCU\Software` و `HKLM\Software` و `HKCU\Environment`. افتحه فقط إذا قبلت هذا.
-- تشغيل الاختبارات يحتاج الإصدارين المثبّتين بالضبط: PowerShell `7.7.0` و `@openai/codex@0.171.0`. حزمة Codex تُستخدم كمحرك sandbox فقط؛ لا تحتاج حساب OpenAI ولا model. إذا تحدّث أحدهما تفشل الاختبارات حتى يُحدَّث التثبيت في المشروع.
+- تشغيل الاختبارات يحتاج الإصدارين المثبّتين بالضبط: PowerShell `7.6.10` و `@openai/codex@0.171.0`. حزمة Codex تُستخدم كمحرك sandbox فقط؛ لا تحتاج حساب OpenAI ولا model. إذا تحدّث أحدهما تفشل الاختبارات حتى يُحدَّث التثبيت في المشروع.
 - هذا إصدار تجريبي (prerelease) جُرّب على جهاز واحد. ملف `SHA256SUMS.txt` من الإصدار نفسه يكشف تلف التنزيل فقط، ولا يثبت من نشر الإصدار.
 
 ### المزيد

@@ -4,7 +4,7 @@ Edge Project Bridge lets a remote AI model read one local project folder, create
 
 ## Quick install
 
-Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.6.0-pre2`), and run this block. It downloads `install.ps1` and `SHA256SUMS.txt`, checks the SHA-256 hash, stops if they differ, and runs the installer:
+Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.6.0-pre3`), and run this block. It downloads `install.ps1` and `SHA256SUMS.txt`, checks the SHA-256 hash, stops if they differ, and runs the installer:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -43,7 +43,7 @@ If you downloaded `install.ps1` in a web browser, unblock it first with `Unblock
 
 The installer always installs the core level. It does not install software for you—if anything for test runs is missing, it finishes the core install and prints what to install next. After installing missing tools, open a **new** PowerShell 7 window and run `.\setup-worker.ps1` in the install folder.
 
-> **Exact pinned builds:** The worker checks the exact SHA-256 hash of both PowerShell `7.7.0` x64 (`%ProgramFiles%\PowerShell\7\pwsh.exe`) and `@openai/codex@0.171.0`. If Windows, `winget`, or `npm` updates either tool to a newer build, test runs fail until Edge Project Bridge updates its pins. The core level is not affected.
+> **Exact pinned builds:** The worker checks the exact SHA-256 hash of both PowerShell `7.6.10` x64 (`%ProgramFiles%\PowerShell\7\pwsh.exe`) and `@openai/codex@0.171.0`. If Windows, `winget`, or `npm` updates either tool to a newer build, test runs fail until Edge Project Bridge updates its pins. The core level is not affected.
 
 ## What the remote model can and cannot do
 
@@ -155,7 +155,7 @@ The installer writes these PowerShell 7 helper scripts into `<InstallDir>`. Ever
 | --- | --- | --- |
 | `uv` | `uv` on `PATH` (builds `<InstallDir>\runtime\.venv`) | `winget install --id astral-sh.uv` or [uv docs](https://docs.astral.sh/uv/getting-started/installation/) |
 | Python 3.13 | Local Python `>=3.13,<3.14` | `winget install --id Python.Python.3.13` or [python.org](https://www.python.org/downloads/) |
-| Pinned PowerShell 7.7.0 x64 | `%ProgramFiles%\PowerShell\7\pwsh.exe` with SHA-256 `e94166ed9f376559c1359bafb08bc49e463a494c330f67644ec1d9f1ffeb5ee5` (for `powershell_script` runs) | Install `PowerShell-7.7.0-win-x64.msi` (not the Microsoft Store app) from the [PowerShell 7.7.0 release](https://github.com/PowerShell/PowerShell/releases/tag/v7.7.0) |
+| Pinned PowerShell 7.6.10 x64 | `%ProgramFiles%\PowerShell\7\pwsh.exe` with SHA-256 `e94166ed9f376559c1359bafb08bc49e463a494c330f67644ec1d9f1ffeb5ee5` (for `powershell_script` runs) | Install `PowerShell-7.6.10-win-x64.msi` (not the Microsoft Store app) from the [PowerShell 7.6.10 release](https://github.com/PowerShell/PowerShell/releases/tag/v7.6.10) |
 | Pinned Codex sandbox binary | `@openai/codex@0.171.0` at `%APPDATA%\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe` with SHA-256 `cefea4ffee1fff04983a99c0dda99944d8b380e891e740a28b32f4b815a6e0b7` (for every sandboxed run) | `npm install -g @openai/codex@0.171.0` (requires [Node.js / npm](https://nodejs.org/)) |
 
 ### Optional and runtime requirements
@@ -214,7 +214,7 @@ The installer does not upgrade in place. Install the newer version into a new fo
 | --- | --- | --- |
 | `#Requires -Version 7` error | Opened Windows PowerShell 5.1 instead of PowerShell 7 | Run `pwsh -ExecutionPolicy Bypass -File .\install.ps1 ...` |
 | Script blocked by execution policy or Windows download warning | Downloaded script is blocked or policy is `Restricted` / `AllSigned` | Run `Unblock-File -LiteralPath .\install.ps1` and launch with `pwsh -ExecutionPolicy Bypass -File .\install.ps1 ...` |
-| `Queued test runs do NOT work yet on this PC` | Missing or wrong-version `uv`, Python 3.13, PowerShell 7.7.0 x64 MSI, or `@openai/codex@0.171.0` (core install succeeded) | Install the listed items, open a new PowerShell 7 window, and run `.\setup-worker.ps1` |
+| `Queued test runs do NOT work yet on this PC` | Missing or wrong-version `uv`, Python 3.13, PowerShell 7.6.10 x64 MSI, or `@openai/codex@0.171.0` (core install succeeded) | Install the listed items, open a new PowerShell 7 window, and run `.\setup-worker.ps1` |
 | `The worker runtime is not built yet` | `start-worker.ps1` ran before `runtime\.venv` existed | Run `.\setup-worker.ps1` |
 | `Refusing to install: the install folder is not empty` | `<InstallDir>` already has files | Choose a new or empty folder |
 | `Refusing path ... reparse point` / `starting with '~'` / `UNC` | Path uses `~`, `\\`, or passes through a junction/symlink | Use a regular local path (for example `C:\Projects\MyApp`) |
@@ -223,4 +223,5 @@ The installer does not upgrade in place. Install the newer version into a new fo
 | `SHA-256 verification is required` / `SHA-256 mismatch` | Missing checksum, wrong hash passed to `-Sha256` (remember it takes the `.zip` hash, not `install.ps1`), or corrupted zip | Check you passed the `.zip` hash from `SHA256SUMS.txt` or re-download; never extract a mismatched zip |
 | `uv sync` fails | No network access to PyPI (packages not cached) or Python 3.13 missing | Verify network access and that Python 3.13 is installed, then re-run `.\setup-worker.ps1` in a new PowerShell 7 window |
 | Worker refuses run with `PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS` | Persistent Windows environment variables look like credentials | Run `.\environment-check.ps1` to see the variable names and remove them from persistent Windows environment variables |
-| Worker fails with `ISOLATION_NOT_VERIFIED` | Not on interactive desktop (`WinSta0\Default`), or pinned PowerShell 7.7.0 / Codex 0.171.0 changed | Start `.\start-worker.ps1` from a normal desktop session and restore the exact pinned builds |
+| Worker fails with `ISOLATION_NOT_VERIFIED` | Not on interactive desktop (`WinSta0\Default`), or pinned PowerShell 7.6.10 / Codex 0.171.0 changed | Start `.\start-worker.ps1` from a normal desktop session and restore the exact pinned builds |
+| Worker fails with `STATE_TOKEN_OWNER_MISMATCH` | `start.ps1` or `start-worker.ps1` was launched from an elevated (Administrator) PowerShell window or an always-elevated account (such as Windows Sandbox) | Close the elevated shell, open a standard (non-Administrator) PowerShell 7 window under your normal Windows account, and run `.\start.ps1` again |
