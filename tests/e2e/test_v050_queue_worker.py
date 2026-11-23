@@ -258,7 +258,7 @@ class Example(unittest.TestCase):
         self.python_test("import unittest\nclass Example(unittest.TestCase):\n    def test_ok(self): pass\n")
         folder = self.project / "_pro" / "reports"
         folder.mkdir(parents=True)
-        for number in range(260):
+        for number in range(1050):
             (folder / f"note_{number}.json").write_text("{}", encoding="utf-8")
         run_id, _ = self.queue(task_id="crowded-review-folder")
         details = self.completed(run_id, "succeeded")
@@ -721,7 +721,7 @@ json.dumps = pause_before_publishing_receipt
         self.python_test("import unittest\nclass Example(unittest.TestCase):\n    def test_ok(self): pass\n")
         extra = self.project / "data"
         extra.mkdir()
-        for i in range(31):
+        for i in range(127):
             (extra / f"fixture_{i}.json").write_text("{}", encoding="utf-8")
         script = self.project / "check.ps1"
         script.write_text("Write-Output 'SECOND_RUN'\n", encoding="utf-8")
@@ -729,7 +729,10 @@ json.dumps = pause_before_publishing_receipt
         second, _ = self.queue("powershell_script", [script.name], task_id="after-budget", grant=grant)
         rejected, completed = self.worker()
         self.assertEqual((rejected["run"]["run_id"], rejected["run"]["state"]), (first, "failed"))
-        self.assertEqual(rejected["failure_code"], "RESOURCE_BUDGET_EXCEEDED")
+        self.assertTrue(rejected["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), rejected)
+        self.assertIn("129", rejected["failure_code"])
+        self.assertIn("128", rejected["failure_code"])
+        self.assertIn("129", self.output(first, grant))
         self.assertNotIn("mxc_receipt", rejected)
         self.assert_no_workload_manifest(first)
         self.assertEqual((completed["run"]["run_id"], completed["run"]["state"]), (second, "succeeded"))
@@ -1018,6 +1021,140 @@ class CalcTests(unittest.TestCase):
         self.assertEqual(one_details["test_counts"]["passed"], 1)
         self.assert_raw_removed(run_one)
         self.assert_signed_capture(one_details)
+
+    def test_79_file_project_with_136k_module_and_no_tests_init_runs_python_tests(self):
+        (self.tests / "__init__.py").unlink()
+        pkg = self.project / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        big_text = "VALUE = 42\n# " + ("x" * (136 * 1024 - 20)) + "\n"
+        (pkg / "big_module.py").write_text(big_text, encoding="utf-8")
+        for idx in range(74):
+            (pkg / f"mod_{idx:02d}.py").write_text(f"N = {idx}\n", encoding="utf-8")
+        (self.tests / "helper.py").write_text("OFFSET = 8\n", encoding="utf-8")
+        (self.project / "secrets.json").write_text('{"secret": "DO_NOT_COPY"}\n', encoding="utf-8")
+        methods = "\n".join(
+            f"    def test_case_{idx:02d}(self): self.assertEqual(big_module.VALUE + helper.OFFSET, 50)"
+            for idx in range(88)
+        )
+        self.python_test(
+            "from pathlib import Path\nimport unittest\nfrom pkg import big_module\nimport helper\n"
+            "class LargeSuite(unittest.TestCase):\n"
+            "    def test_hygiene(self):\n"
+            "        self.assertFalse(Path('secrets.json').exists())\n"
+            "        self.assertFalse(Path('tests/__init__.py').exists())\n"
+            f"{methods}\n"
+        )
+        (self.tests / "test_extra.py").write_text(
+            "import unittest\nfrom pkg import big_module\n"
+            "class Extra(unittest.TestCase):\n"
+            "    def test_one(self): self.assertEqual(big_module.VALUE, 42)\n",
+            encoding="utf-8",
+        )
+        # 76 pkg files + tests/helper.py + tests/test_worker.py + tests/test_extra.py = 79 files, 90 tests.
+        run_id, grant = self.queue(task_id="large-no-init")
+        details = self.completed(run_id, "succeeded")
+        self.assertEqual(len(details["mxc_receipt"]["approved_files"]), 79)
+        self.assertEqual(details["test_counts"], {"executed": 90, "passed": 90, "failed": 0, "skipped": 0})
+        self.assertFalse((self.tests / "__init__.py").exists())
+        self.assertNotIn("secrets.json", details["mxc_receipt"]["approved_files"])
+        self.assertNotIn("DO_NOT_COPY", self.output(run_id, grant))
+        self.assert_signed_capture(details)
+
+    def test_snapshot_limit_refusals_report_limit_and_measured_value(self):
+        self.python_test("import unittest\nclass Example(unittest.TestCase):\n    def test_ok(self): pass\n")
+        grant = self.command("grant-create", self.project_id, "--profile", "pro-review")["grant_id"]
+
+        # 1. Per-file > 256 KiB.
+        huge = self.project / "huge_mod.py"
+        huge.write_text("SECRET_BODY_MARKER\n" + ("a" * (256 * 1024)), encoding="utf-8")
+        r1, _ = self.queue(task_id="lim-file", grant=grant)
+        d1 = self.completed(r1, "failed")
+        self.assertTrue(d1["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), d1)
+        self.assertIn("huge_mod.py", d1["failure_code"])
+        self.assertIn("262144", d1["failure_code"])
+        self.assertNotIn("SECRET_BODY_MARKER", d1["failure_code"])
+        self.assertIn("huge_mod.py", self.output(r1, grant))
+        huge.unlink()
+
+        # 2. Total bytes > 4 MiB.
+        bulk = self.project / "bulk"
+        bulk.mkdir()
+        chunk = "b" * (250 * 1024)
+        for i in range(17):
+            (bulk / f"b_{i:02d}.py").write_text(chunk, encoding="utf-8")
+        r2, _ = self.queue(task_id="lim-total", grant=grant)
+        d2 = self.completed(r2, "failed")
+        self.assertTrue(d2["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), d2)
+        self.assertIn("total size", d2["failure_code"])
+        self.assertIn("4194304", d2["failure_code"])
+        for p in bulk.iterdir():
+            p.unlink()
+        bulk.rmdir()
+
+        # 3. Entry count > 1,000.
+        entries = self.project / "entries"
+        entries.mkdir()
+        for i in range(1001):
+            (entries / f"e_{i:04d}.txt").write_text("x", encoding="utf-8")
+        r3, _ = self.queue(task_id="lim-entries", grant=grant)
+        d3 = self.completed(r3, "failed")
+        self.assertTrue(d3["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), d3)
+        self.assertIn("1001", d3["failure_code"])
+        self.assertIn("1000", d3["failure_code"])
+
+    def test_python_tests_work_without_tests_init_runs_full_and_selector(self):
+        (self.tests / "__init__.py").unlink()
+        (self.project / "calc.py").write_text("def add(a, b): return a - b\n", encoding="utf-8")
+        (self.tests / "helper.py").write_text("BONUS = 0\n", encoding="utf-8")
+        self.python_test(
+            "from pathlib import Path\nimport unittest\nfrom calc import add\nimport helper\n"
+            "class CalcTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertFalse(Path('tests/__init__.py').exists())\n"
+            "        self.assertEqual(add(2, 3) + helper.BONUS, 5)\n"
+            "    def test_other(self):\n"
+            "        self.assertEqual(add(10, 4), 14)\n"
+        )
+        grant = self.command("grant-create", self.project_id, "--profile", "pro-agent")["grant_id"]
+        self.mcp(
+            "work_copy",
+            {"project_id": self.project_id, "grant_id": grant, "workspace": "no-init", "paths": ["calc.py", "tests"]},
+            "executor:default",
+        )
+        self.mcp(
+            "work_edit",
+            {
+                "project_id": self.project_id,
+                "grant_id": grant,
+                "workspace": "no-init",
+                "operation_id": "fix-calc-no-init",
+                "edits": [{"path": "calc.py", "replacements": [{"old_text": "a - b", "new_text": "a + b"}]}],
+            },
+            "executor:default",
+        )
+        found = self.command("environment-check")
+        run_all, _ = self.queue("python_tests_work", ["no-init"], task_id="work-no-init-all", grant=grant)
+        details, = self.worker(allow_work_exec=True)
+        if found["credential_like_count"] > 0:
+            self.assertEqual(details["run"]["state"], "failed")
+            self.assertTrue(details["failure_code"].startswith("PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS:"))
+            return
+        self.assertEqual(details["run"]["state"], "succeeded", details)
+        self.assertEqual(details["test_counts"], {"executed": 2, "passed": 2, "failed": 0, "skipped": 0})
+        self.assertFalse((self.tests / "__init__.py").exists())
+        self.assertFalse((self.project / "_pro" / "work" / "no-init" / "tests" / "__init__.py").exists())
+
+        run_one, _ = self.queue(
+            "python_tests_work",
+            ["no-init", "tests.test_worker.CalcTests.test_add"],
+            task_id="work-no-init-one",
+            grant=grant,
+        )
+        one_details, = self.worker(allow_work_exec=True)
+        self.assertEqual(one_details["run"]["state"], "succeeded", one_details)
+        self.assertEqual(one_details["test_counts"], {"executed": 1, "passed": 1, "failed": 0, "skipped": 0})
+        self.assertFalse((self.project / "_pro" / "work" / "no-init" / "tests" / "__init__.py").exists())
 
 
 if __name__ == "__main__":

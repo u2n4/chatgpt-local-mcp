@@ -364,6 +364,12 @@ def _validate_test_target(test_target: str | None) -> str | None:
 
 
 _PROJECT_TEST_TARGET_SHIM = "import sys, unittest; sys.path.insert(0, '.'); unittest.main(module=None)"
+_PROJECT_TEST_NO_INIT_DISCOVER_SHIM = (
+    "import os, sys, unittest; sys.path.insert(0, os.path.abspath('.')); unittest.main(module=None)"
+)
+_PROJECT_TEST_NO_INIT_TARGET_SHIM = (
+    "import os, sys, unittest; sys.path[:0] = [os.path.abspath('tests'), os.path.abspath('.')]; unittest.main(module=None)"
+)
 
 
 def _payload_command(
@@ -378,10 +384,19 @@ def _payload_command(
     if recipe == "calculator":
         return _command(workspace, PYTHON_ARGS)
     if recipe == "project_tests":
+        has_tests_init = (workspace / "tests" / "__init__.py").is_file()
         validated_target = _validate_test_target(test_target)
         if validated_target is not None:
-            return _command(workspace, ("-I", "-S", "-B", "-c", _PROJECT_TEST_TARGET_SHIM, validated_target, "-v"))
-        return _command(workspace, PROJECT_TEST_ARGS)
+            if has_tests_init:
+                return _command(workspace, ("-I", "-S", "-B", "-c", _PROJECT_TEST_TARGET_SHIM, validated_target, "-v"))
+            local_target = validated_target.removeprefix("tests.")
+            return _command(workspace, ("-I", "-S", "-B", "-c", _PROJECT_TEST_NO_INIT_TARGET_SHIM, local_target, "-v"))
+        if has_tests_init:
+            return _command(workspace, PROJECT_TEST_ARGS)
+        return _command(
+            workspace,
+            ("-I", "-S", "-B", "-c", _PROJECT_TEST_NO_INIT_DISCOVER_SHIM, "discover", "-s", "tests", "-v"),
+        )
     if recipe == "node_tests":
         return _command(workspace, NODE_TEST_ARGS, _node_path())
     if recipe == "powershell_script":
@@ -719,7 +734,7 @@ def prepare_recipe(workspace: Path, control: Path, recipe: str,
         listener.listen()
         probe_file = "build_knot.py" if recipe == "blender_knot" else "calculator.py"
         if recipe == "project_tests":
-            probe_file = "tests/__init__.py"
+            probe_file = "tests/__init__.py" if (workspace / "tests" / "__init__.py").is_file() else "tests"
         elif recipe == "node_tests":
             probe_file = "tests"
         elif recipe == "powershell_script":

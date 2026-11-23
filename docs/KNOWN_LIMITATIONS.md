@@ -42,8 +42,8 @@ Git reads do not look inside nested repositories or submodules. A change inside 
 
 Limits enforced on `python_tests_work`:
 - **Wall time:** at most 60 seconds (`min(60 s, grant.limits.max_duration_seconds)`).
-- **Test runner:** standard-library `unittest` only (`python -I -S -B`); no third-party packages. Accepts `[workspace]` or `[workspace, test_selector]` (`tests/test_<name>.py` or `tests.test_<name>[.<Class>[.<method>]]`).
-- **Work snapshot:** up to 128 `.py`/`.json` files, 256 KiB per file, 4 MiB total, 1,000 visible entries, depth 6; symlinks/junctions, hardlinked files (`n_links != 1`), and hidden/credential files are refused or omitted.
+- **Test runner:** standard-library `unittest` only (`python -I -S -B`); no third-party packages. Accepts `[workspace]` or `[workspace, test_selector]` (`tests/test_<name>.py` or `tests.test_<name>[.<Class>[.<method>]]`). Works both when `tests/__init__.py` is present (runs `discover -s tests -t .`) and when `tests/__init__.py` is absent (adds the snapshot root to `sys.path` and runs `discover -s tests`; selectors run with `tests/` and the snapshot root on `sys.path`).
+- **Python snapshot limits (shared by `python_tests` and `python_tests_work`):** up to 128 `.py`/`.json` files, 256 KiB per file, 4 MiB total, 1,000 visible entries, depth 6; symlinks/junctions, hardlinked files (`n_links != 1`), and hidden/credential files are refused or omitted. Refusals report the exceeded limit and measured value without file contents. `powershell_script` limits are unchanged (1 script <= 64 KiB).
 - **CPU hard cap:** Win32 Job Object hard cap of `min(50%, grant.limits.max_cpu_percent)`; if the cap cannot be set, the run is refused with `INVALID_GRANT_LIMITS`.
 - **Mandatory persistent-environment check:** `--allow-environment-credentials` does not apply to `python_tests_work` (there is no override flag for work-copy runs).
 - **No PowerShell work recipe:** `powershell_script_work` is refused everywhere (`grant-create`, `task_submit`, and `worker`) with `POWERSHELL_SCRIPT_WORK_UNSUPPORTED`.

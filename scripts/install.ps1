@@ -382,9 +382,9 @@ if ($projectWithSlash.StartsWith($installWithSlash, [System.StringComparison]::O
 
 if ([string]::IsNullOrWhiteSpace($ZipPath) -and [string]::IsNullOrWhiteSpace($Version)) {
     if (-not $interactive) {
-        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.6.0-pre1).'
+        throw 'Provide either -ZipPath (local release archive) or -Version (GitHub Release version, e.g. 0.6.0-pre2).'
     }
-    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.6.0-pre1)?'
+    $answer = Read-Host 'Which release version should be downloaded (e.g. 0.6.0-pre2)?'
     $cleaned = Remove-OuterQuotes $answer
     if ([string]::IsNullOrWhiteSpace($cleaned)) { throw 'A release version is required when -ZipPath is not supplied.' }
     $Version = $cleaned
@@ -781,20 +781,25 @@ Write-Output 'A test run also needs the exact PowerShell 7.7.0 and Codex 0.171.0
 #Requires -Version 7
 [CmdletBinding()]
 param(
+    [Alias('Profile')]
     [ValidateSet('pro-review', 'pro-agent')]
-    [string]$Profile = 'pro-review'
+    [string]$GrantProfile = 'pro-review',
+
+    [ValidateRange(1, 1440)]
+    [int]$Minutes = 60
 )
 
 $ErrorActionPreference = 'Stop'
 $configPath = Join-Path $PSScriptRoot 'install.json'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
-$raw = & $config.exe_path "--state-dir=$($config.state_dir)" grant-create "--profile=$Profile" -- $config.project_id
+$raw = & $config.exe_path "--state-dir=$($config.state_dir)" grant-create "--profile=$GrantProfile" "--ttl-minutes=$Minutes" -- $config.project_id
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $grant = ($raw -join "`n") | ConvertFrom-Json
-Write-Output "profile: $Profile"
+$expiresText = if ($grant.expires_at -is [datetime]) { $grant.expires_at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { [string]$grant.expires_at }
+Write-Output "profile: $GrantProfile"
 Write-Output "grant_id: $($grant.grant_id)"
-Write-Output "expires_at: $($grant.expires_at)"
+Write-Output "expires_at: $expiresText"
 Write-Output "project_id: $($grant.project_id)"
 '@
 
@@ -811,8 +816,638 @@ $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom
 exit $LASTEXITCODE
 '@
 
+    $startContent = @'
+#Requires -Version 7
+[CmdletBinding(PositionalBinding = $false)]
+param(
+    [Alias('Profile')]
+    [ValidateSet('pro-review', 'pro-agent')]
+    [string]$GrantProfile = 'pro-agent',
+
+    [ValidateRange(1, 1440)]
+    [int]$Minutes = 240,
+
+    [switch]$AllowWorkExec,
+
+    [Parameter(ValueFromRemainingArguments)]
+    [string[]]$WorkerArgs
+)
+
+$ErrorActionPreference = 'Stop'
+if ($null -ne $WorkerArgs) {
+    foreach ($arg in $WorkerArgs) {
+        if ($arg -ieq '--allow-work-exec' -or $arg.StartsWith('--allow-work-exec=', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Use the -AllowWorkExec switch instead of passing --allow-work-exec directly.'
+        }
+    }
+}
+
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+$config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+$envRaw = & $config.exe_path "--state-dir=$($config.state_dir)" environment-check
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$envCheck = ($envRaw -join "`n") | ConvertFrom-Json
+if (-not $envCheck.readable) {
+    Write-Output 'Stopped: could not read persistent Windows environment variables.'
+    Write-Output 'Test runs are refused when persistent environment variables cannot be checked. Run .\environment-check.ps1 for details.'
+    exit 1
+}
+if ($null -ne $envCheck.credential_like_count -and [int]$envCheck.credential_like_count -gt 0) {
+    Write-Output "Stopped: found $($envCheck.credential_like_count) credential-like entry(ies) in your persistent Windows environment:"
+    foreach ($name in @($envCheck.credential_like_names)) {
+        Write-Output "  - $name"
+    }
+    Write-Output 'Test runs are refused while these exist because sandboxed code can read persistent environment keys.'
+    Write-Output 'Remove those entries from your persistent Windows environment variables, open a new PowerShell 7 window, and run .\start.ps1 again.'
+    exit 1
+}
+
+if ($AllowWorkExec) {
+    Write-Output 'Warning: -AllowWorkExec lets code written by the model run inside the sandbox on this PC.'
+    Write-Output 'That code can read your Windows user name, profile paths, and the registry keys HKCU\Software, HKLM\Software, and HKCU\Environment.'
+    Write-Output 'Enable this only if you accept that exposure.'
+    $confirm = Read-Host 'Continue with -AllowWorkExec? [y/N]'
+    if ($null -eq $confirm -or $confirm.Trim().ToLowerInvariant() -notin @('y', 'yes')) {
+        Write-Output 'Cancelled. Run .\start.ps1 without -AllowWorkExec to start with work execution off.'
+        exit 1
+    }
+}
+
+$grantRaw = & $config.exe_path "--state-dir=$($config.state_dir)" grant-create "--profile=$GrantProfile" "--ttl-minutes=$Minutes" -- $config.project_id
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$grant = ($grantRaw -join "`n") | ConvertFrom-Json
+$expiresText = if ($grant.expires_at -is [datetime]) { $grant.expires_at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { [string]$grant.expires_at }
+Write-Output "profile: $GrantProfile"
+Write-Output "grant_id: $($grant.grant_id)"
+Write-Output "expires_at: $expiresText"
+Write-Output "project_id: $($grant.project_id)"
+if ($GrantProfile -eq 'pro-agent') {
+    Write-Output 'Model access: read project and Git, create under _pro\outbox\ and _pro\reports\, edit copies under _pro\work\, and queue tests (project files stay read-only until .\apply.ps1).'
+} else {
+    Write-Output 'Model access: read project and Git, create new files under _pro\outbox\ and _pro\reports\, and queue tests (project files stay read-only).'
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $config.runtime_dir '.venv\Scripts\python.exe') -PathType Leaf)) {
+    Write-Output ''
+    Write-Output 'The worker runtime is not built yet, so queued test runs will not start.'
+    Write-Output 'Reading, copying, editing, and diffing work now with the grant above.'
+    Write-Output 'To enable test runs, install any missing prerequisites (see .\status.ps1) and run .\setup-worker.ps1.'
+    exit 0
+}
+
+$workerCmdArgs = [System.Collections.Generic.List[string]]::new()
+$workerCmdArgs.Add("--state-dir=$($config.state_dir)")
+$workerCmdArgs.Add('worker')
+$workerCmdArgs.Add("--runtime-root=$($config.runtime_dir)")
+if ($AllowWorkExec) { $workerCmdArgs.Add('--allow-work-exec') }
+if ($null -ne $WorkerArgs) {
+    foreach ($arg in $WorkerArgs) { $workerCmdArgs.Add($arg) }
+}
+
+Write-Output 'Starting local worker (press Ctrl+C to stop)...'
+& $config.exe_path @workerCmdArgs
+exit $LASTEXITCODE
+'@
+
+    $applyContent = @'
+#Requires -Version 7
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory, Position = 0)]
+    [string]$Workspace
+)
+
+$ErrorActionPreference = 'Stop'
+if ($Workspace -cnotmatch '\A[a-z0-9][a-z0-9_-]{0,39}\z') {
+    throw "Invalid workspace name '$Workspace'. Expected 1 to 40 lowercase letters, digits, '_' or '-', starting with a letter or digit."
+}
+
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+$config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+$dryRaw = & $config.exe_path "--state-dir=$($config.state_dir)" work-apply -- $config.project_id $Workspace
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$dry = ($dryRaw -join "`n") | ConvertFrom-Json
+
+Write-Output "Workspace: $($dry.workspace)"
+Write-Output "Files changed: $($dry.files_changed)"
+if (@($dry.files_added).Count -gt 0) {
+    Write-Output 'Added:'
+    foreach ($p in @($dry.files_added)) { Write-Output "  + $p" }
+}
+if (@($dry.files_modified).Count -gt 0) {
+    Write-Output 'Modified:'
+    foreach ($p in @($dry.files_modified)) { Write-Output "  ~ $p" }
+}
+if (@($dry.files_deleted).Count -gt 0) {
+    Write-Output 'Deleted:'
+    foreach ($p in @($dry.files_deleted)) { Write-Output "  - $p" }
+}
+if (@($dry.drifted_files).Count -gt 0) {
+    Write-Output 'Drifted (project file changed after copy):'
+    foreach ($p in @($dry.drifted_files)) { Write-Output "  ! $p" }
+}
+if (@($dry.conflict_files).Count -gt 0) {
+    Write-Output 'Conflicts (target already exists in project):'
+    foreach ($p in @($dry.conflict_files)) { Write-Output "  ! $p" }
+}
+if (-not [string]::IsNullOrEmpty($dry.unified_diff)) {
+    Write-Output ''
+    Write-Output $dry.unified_diff
+}
+if (-not $dry.safe_to_apply) {
+    Write-Output 'Cannot apply because of drift or conflicts above. No project files were changed.'
+    exit 1
+}
+if ([int]$dry.files_changed -eq 0) {
+    Write-Output 'No changes to apply.'
+    exit 0
+}
+
+$confirm = Read-Host 'Apply these changes to the project? [y/N]'
+if ($null -eq $confirm -or $confirm.Trim().ToLowerInvariant() -notin @('y', 'yes')) {
+    Write-Output 'Cancelled. No project files were changed.'
+    exit 0
+}
+
+$applyRaw = & $config.exe_path "--state-dir=$($config.state_dir)" work-apply --confirm -- $config.project_id $Workspace
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$applied = ($applyRaw -join "`n") | ConvertFrom-Json
+$journalId = [string]$applied.journal_id
+Write-Output "Applied workspace '$Workspace' ($($applied.files_changed) file(s))."
+Write-Output "journal_id: $journalId"
+if ($journalId -cmatch '\Apjr_[0-9a-fA-F]{32}\z') {
+    Write-Output "To roll back: .\rollback.ps1 $journalId"
+}
+'@
+
+    $rollbackContent = @'
+#Requires -Version 7
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory, Position = 0)]
+    [string]$JournalId
+)
+
+$ErrorActionPreference = 'Stop'
+if ($JournalId -cnotmatch '\Apjr_[0-9a-fA-F]{32}\z') {
+    throw "Invalid journal ID '$JournalId'. Expected 'pjr_' followed by 32 hexadecimal characters."
+}
+
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+$config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+$raw = & $config.exe_path "--state-dir=$($config.state_dir)" rollback-patch "--project-root=$($config.project_path)" "--journal-id=$JournalId"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$res = ($raw -join "`n") | ConvertFrom-Json
+Write-Output "Rolled back journal: $($res.journal_id)"
+$restored = @($res.restored_files)
+if ($restored.Count -eq 0) {
+    Write-Output '  (no files reported)'
+} else {
+    foreach ($p in $restored) { Write-Output "  restored: $p" }
+}
+'@
+
+    $statusContent = (@'
+#Requires -Version 7
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$PINNED_CODEX_VERSION = '__PINNED_CODEX_VERSION__'
+$PINNED_CODEX_SHA256 = '__PINNED_CODEX_SHA256__'
+$PINNED_POWERSHELL_SHA256 = '__PINNED_POWERSHELL_SHA256__'
+
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+$config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+$binVersion = $null
+if (Test-Path -LiteralPath $config.exe_path -PathType Leaf) {
+    $vOut = & $config.exe_path --version 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($vOut -join ''))) {
+        $binVersion = ($vOut | Select-Object -First 1).Trim()
+    }
+}
+if ([string]::IsNullOrWhiteSpace($binVersion)) { $binVersion = '(unknown)' }
+
+$runtimeBuilt = Test-Path -LiteralPath (Join-Path $config.runtime_dir '.venv\Scripts\python.exe') -PathType Leaf
+
+$missingPrereqs = [System.Collections.Generic.List[string]]::new()
+$uvCmd = Get-Command -Name 'uv' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $uvCmd) {
+    $missingPrereqs.Add('uv: not found on PATH')
+}
+
+$python313Path = $null
+if ($null -ne $uvCmd) {
+    $saved = @{}
+    foreach ($name in @('UV_PROJECT', 'UV_PROJECT_ENVIRONMENT', 'UV_WORKING_DIRECTORY', 'UV_CONFIG_FILE', 'VIRTUAL_ENV')) {
+        if (Test-Path -LiteralPath "Env:$name") {
+            $saved[$name] = (Get-Item -LiteralPath "Env:$name").Value
+            Remove-Item -LiteralPath "Env:$name"
+        }
+    }
+    Push-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+    try {
+        $found = & $uvCmd.Source --no-config python find --system --no-python-downloads '>=3.13,<3.14' 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($found)) {
+            $candidate = ($found | Select-Object -First 1).Trim()
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $python313Path = $candidate }
+        }
+    } finally {
+        Pop-Location
+        foreach ($name in $saved.Keys) { Set-Item -LiteralPath "Env:$name" -Value $saved[$name] }
+    }
+} else {
+    $pyLauncher = Get-Command -Name 'py' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $pyLauncher) {
+        $found = & $pyLauncher.Source -3.13 -c 'import sys; print(sys.executable)' 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($found)) {
+            $candidate = ($found | Select-Object -First 1).Trim()
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $python313Path = $candidate }
+        }
+    }
+}
+if ($null -eq $python313Path) {
+    $missingPrereqs.Add('Python 3.13 (>=3.13,<3.14): not found')
+}
+
+$pwshPinnedPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+if (-not (Test-Path -LiteralPath $pwshPinnedPath -PathType Leaf)) {
+    $missingPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): not found")
+} else {
+    $pwshHash = (Get-FileHash -LiteralPath $pwshPinnedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($pwshHash -ne $PINNED_POWERSHELL_SHA256) {
+        $missingPrereqs.Add("Pinned PowerShell 7.7.0 x64 ($pwshPinnedPath): SHA-256 mismatch")
+    }
+}
+
+$codexPinnedPath = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+if (-not (Test-Path -LiteralPath $codexPinnedPath -PathType Leaf)) {
+    $missingPrereqs.Add("Pinned Codex sandbox binary (@openai/codex $PINNED_CODEX_VERSION): not found")
+} else {
+    $codexHash = (Get-FileHash -LiteralPath $codexPinnedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($codexHash -ne $PINNED_CODEX_SHA256) {
+        $missingPrereqs.Add("Pinned Codex sandbox binary (@openai/codex $PINNED_CODEX_VERSION): SHA-256 mismatch")
+    }
+}
+
+Write-Output "Binary version : $binVersion"
+if (-not [string]::IsNullOrWhiteSpace($config.version)) {
+    Write-Output "Release version: $($config.version)"
+}
+Write-Output "Project path   : $($config.project_path)"
+Write-Output "Project ID     : $($config.project_id)"
+Write-Output ("Worker runtime : " + $(if ($runtimeBuilt) { 'built' } else { 'not built (run .\setup-worker.ps1)' }))
+
+if ($missingPrereqs.Count -eq 0) {
+    Write-Output 'Missing test-run prerequisites: none'
+} else {
+    Write-Output 'Missing test-run prerequisites:'
+    foreach ($item in $missingPrereqs) { Write-Output "  - $item" }
+}
+
+$workRoot = Join-Path $config.project_path '_pro\work'
+Write-Output 'Workspaces (_pro\work\):'
+if (Test-Path -LiteralPath $workRoot -PathType Container) {
+    $wsDirs = @(Get-ChildItem -LiteralPath $workRoot -Directory | Sort-Object Name)
+    if ($wsDirs.Count -eq 0) {
+        Write-Output '  (none)'
+    } else {
+        foreach ($d in $wsDirs) {
+            $count = @(Get-ChildItem -LiteralPath $d.FullName -File -Recurse -ErrorAction SilentlyContinue).Count
+            Write-Output "  - $($d.Name) ($count file(s))"
+        }
+    }
+} else {
+    Write-Output '  (none)'
+}
+
+foreach ($box in @(@{ Label = 'Outbox (_pro\outbox\)'; Rel = '_pro\outbox' }, @{ Label = 'Reports (_pro\reports\)'; Rel = '_pro\reports' })) {
+    $dir = Join-Path $config.project_path $box.Rel
+    Write-Output "$($box.Label):"
+    if (Test-Path -LiteralPath $dir -PathType Container) {
+        $files = @(Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName)
+        if ($files.Count -eq 0) {
+            Write-Output '  (none)'
+        } else {
+            foreach ($f in $files) {
+                $rel = [System.IO.Path]::GetRelativePath($dir, $f.FullName)
+                Write-Output "  - $rel"
+            }
+        }
+    } else {
+        Write-Output '  (none)'
+    }
+}
+'@).Replace('__PINNED_CODEX_VERSION__', $PINNED_CODEX_VERSION).Replace('__PINNED_CODEX_SHA256__', $PINNED_CODEX_SHA256).Replace('__PINNED_POWERSHELL_SHA256__', $PINNED_POWERSHELL_SHA256)
+
+    $setupTunnelContent = @'
+#Requires -Version 7
+[CmdletBinding()]
+param(
+    [string]$TunnelClientPath,
+
+    [Alias('Profile')]
+    [string]$TunnelProfile = 'chatgpt-local-mcp',
+
+    [string]$ProfileDir,
+
+    [switch]$Force
+)
+
+$ErrorActionPreference = 'Stop'
+if ($TunnelProfile -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
+    throw "Invalid tunnel profile name '$TunnelProfile'. Use 1 to 64 letters, digits, '.', '_' or '-'."
+}
+
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+$config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+
+function Show-MissingTunnelClient {
+    Write-Output 'tunnel-client was not found.'
+    Write-Output 'tunnel-client is OpenAI''s daemon that connects a local MCP server to the OpenAI control plane over an outbound tunnel so ChatGPT web can reach it.'
+    Write-Output 'Install tunnel-client and put it on PATH, or run .\setup-tunnel.ps1 -TunnelClientPath <path-to-tunnel-client.exe>.'
+    Write-Output ''
+    Write-Output 'Setup URLs:'
+    Write-Output '  Tunnels management        : https://platform.openai.com/settings/organization/tunnels'
+    Write-Output '  Runtime API keys          : https://platform.openai.com/settings/organization/api-keys'
+    Write-Output '  ChatGPT connector settings: https://chatgpt.com/#settings/Connectors'
+}
+
+$tcExe = $null
+if (-not [string]::IsNullOrWhiteSpace($TunnelClientPath)) {
+    if ($TunnelClientPath.IndexOf([char]0) -ge 0) { throw 'Invalid -TunnelClientPath.' }
+    $trimmed = $TunnelClientPath.Trim()
+    if ($trimmed.StartsWith('~') -or $trimmed -match '\A[\\/]{2}' -or $trimmed -match '\A[A-Za-z]:(?![\\/])') {
+        throw "Refusing unsupported -TunnelClientPath: $TunnelClientPath"
+    }
+    $psCwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    $fullTc = if ([System.IO.Path]::IsPathFullyQualified($trimmed)) {
+        [System.IO.Path]::GetFullPath($trimmed)
+    } else {
+        [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($psCwd, $trimmed))
+    }
+    if (-not (Test-Path -LiteralPath $fullTc -PathType Leaf)) {
+        Show-MissingTunnelClient
+        Write-Output ''
+        Write-Output "File not found: $fullTc"
+        exit 1
+    }
+    $tcExe = $fullTc
+} else {
+    $cmd = Get-Command -Name 'tunnel-client' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $cmd) {
+        Show-MissingTunnelClient
+        exit 1
+    }
+    $tcExe = $cmd.Source
+}
+
+$resolvedProfileDir = $null
+if (-not [string]::IsNullOrWhiteSpace($ProfileDir)) {
+    if ($ProfileDir.IndexOf([char]0) -ge 0) { throw 'Invalid -ProfileDir.' }
+    $trimmedDir = $ProfileDir.Trim()
+    if ($trimmedDir.StartsWith('~') -or $trimmedDir -match '\A[\\/]{2}' -or $trimmedDir -match '\A[A-Za-z]:(?![\\/])') {
+        throw "Refusing unsupported -ProfileDir: $ProfileDir"
+    }
+    $psCwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    $resolvedProfileDir = if ([System.IO.Path]::IsPathFullyQualified($trimmedDir)) {
+        [System.IO.Path]::GetFullPath($trimmedDir)
+    } else {
+        [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($psCwd, $trimmedDir))
+    }
+    if (Test-Path -LiteralPath $resolvedProfileDir -PathType Leaf) {
+        throw "Profile directory path points to an existing file: $resolvedProfileDir"
+    }
+}
+
+foreach ($checkPath in @([string]$config.exe_path, [string]$config.state_dir)) {
+    if ([string]::IsNullOrWhiteSpace($checkPath) -or $checkPath -match "['`"`r`n\0]") {
+        throw 'Cannot build tunnel MCP command because an install path contains quotes or control characters.'
+    }
+}
+
+Write-Output 'Create or inspect a tunnel at: https://platform.openai.com/settings/organization/tunnels'
+$rawTunnelId = Read-Host 'Tunnel ID (tunnel_ followed by 32 lowercase hex characters)'
+if ($null -eq $rawTunnelId) { $rawTunnelId = '' }
+$tunnelId = $rawTunnelId.Trim().Trim('"', "'")
+if ($tunnelId -cnotmatch '\Atunnel_[0-9a-f]{32}\z') {
+    Write-Output "Invalid tunnel ID. Expected 'tunnel_' followed by 32 lowercase hexadecimal characters."
+    exit 1
+}
+
+Write-Output 'Create a runtime API key (Tunnels Read + Use; not an Admin key) at: https://platform.openai.com/settings/organization/api-keys'
+if ([Console]::IsInputRedirected) {
+    $stdinKey = [Console]::In.ReadLine()
+    if ([string]::IsNullOrWhiteSpace($stdinKey)) {
+        Write-Output 'Runtime API key cannot be empty.'
+        exit 1
+    }
+    $secureKey = [System.Security.SecureString]::new()
+    foreach ($ch in $stdinKey.Trim().ToCharArray()) { $secureKey.AppendChar($ch) }
+    $secureKey.MakeReadOnly()
+    $stdinKey = $null
+} else {
+    $secureKey = Read-Host -Prompt 'Runtime API key (input is hidden)' -AsSecureString
+}
+
+$keyFilePath = Join-Path $config.state_dir 'tunnel-runtime.key'
+if ($keyFilePath -match "['`"`r`n\0]") {
+    throw 'Cannot store runtime API key because state_dir contains quotes or control characters.'
+}
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
+try {
+    $plainKey = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    if ([string]::IsNullOrWhiteSpace($plainKey)) {
+        Write-Output 'Runtime API key cannot be empty.'
+        exit 1
+    }
+    $plainKey = $plainKey.Trim()
+    if ($plainKey -match '[\r\n\0]') {
+        Write-Output 'Runtime API key must be a single line.'
+        exit 1
+    }
+    [System.IO.File]::WriteAllText($keyFilePath, $plainKey, $utf8NoBom)
+    $plainKey = $null
+} finally {
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    $secureKey.Dispose()
+}
+
+try {
+    $acl = Get-Acl -LiteralPath $keyFilePath
+    $acl.SetAccessRuleProtection($true, $false)
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $currentSid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $keyFilePath -AclObject $acl
+} catch {
+    Write-Output "Note: could not tighten ACL on $keyFilePath; keep your install folder private."
+}
+
+$exeFwd = ([string]$config.exe_path).Replace('\', '/')
+$stateFwd = ([string]$config.state_dir).Replace('\', '/')
+$mcpCommand = "'$exeFwd' --state-dir '$stateFwd' mcp --principal executor:default"
+$keyRef = 'file:' + $keyFilePath.Replace('\', '/')
+
+$initArgs = [System.Collections.Generic.List[string]]::new()
+$initArgs.Add('init')
+$initArgs.Add('--sample')
+$initArgs.Add('sample_mcp_stdio_local')
+$initArgs.Add('--profile')
+$initArgs.Add($TunnelProfile)
+$initArgs.Add('--tunnel-id')
+$initArgs.Add($tunnelId)
+$initArgs.Add('--control-plane-api-key-ref')
+$initArgs.Add($keyRef)
+$initArgs.Add('--mcp-command')
+$initArgs.Add($mcpCommand)
+if (-not [string]::IsNullOrWhiteSpace($resolvedProfileDir)) {
+    $initArgs.Add('--profile-dir')
+    $initArgs.Add($resolvedProfileDir)
+}
+if ($Force) { $initArgs.Add('--force') }
+
+& $tcExe @initArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$tunnelConfig = [ordered]@{
+    schema_version     = 1
+    profile_name       = $TunnelProfile
+    tunnel_client_path = $tcExe
+}
+if (-not [string]::IsNullOrWhiteSpace($resolvedProfileDir)) {
+    $tunnelConfig.profile_dir = $resolvedProfileDir
+}
+$tunnelConfigPath = Join-Path $PSScriptRoot 'tunnel.json'
+[System.IO.File]::WriteAllText($tunnelConfigPath, ($tunnelConfig | ConvertTo-Json -Depth 4) + "`n", $utf8NoBom)
+
+$doctorArgs = [System.Collections.Generic.List[string]]::new()
+$doctorArgs.Add('doctor')
+$doctorArgs.Add('--profile')
+$doctorArgs.Add($TunnelProfile)
+$doctorArgs.Add('--explain')
+if (-not [string]::IsNullOrWhiteSpace($resolvedProfileDir)) {
+    $doctorArgs.Add('--profile-dir')
+    $doctorArgs.Add($resolvedProfileDir)
+}
+
+& $tcExe @doctorArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+Write-Output ''
+Write-Output 'Tunnel profile is ready. Two steps left:'
+Write-Output '  1. Start the tunnel and leave the window open:'
+Write-Output '       .\start-tunnel.ps1'
+Write-Output '  2. While the tunnel is running, open https://chatgpt.com/#settings/Connectors, add the tunnel as a connector (or refresh it) - the connector must show 46 tools.'
+'@
+
+    $startTunnelContent = @'
+#Requires -Version 7
+[CmdletBinding()]
+param(
+    [Alias('Profile')]
+    [string]$TunnelProfile,
+
+    [string]$TunnelClientPath,
+
+    [string]$ProfileDir
+)
+
+$ErrorActionPreference = 'Stop'
+$configPath = Join-Path $PSScriptRoot 'install.json'
+if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing installation config: $configPath" }
+
+$tunnelConfigPath = Join-Path $PSScriptRoot 'tunnel.json'
+$tunnelConfig = $null
+if (Test-Path -LiteralPath $tunnelConfigPath -PathType Leaf) {
+    $tunnelConfig = Get-Content -LiteralPath $tunnelConfigPath -Raw -Encoding utf8 | ConvertFrom-Json
+} elseif ([string]::IsNullOrWhiteSpace($TunnelProfile)) {
+    throw 'Tunnel is not configured yet. Run .\setup-tunnel.ps1 first.'
+}
+
+$effectiveProfile = if (-not [string]::IsNullOrWhiteSpace($TunnelProfile)) { $TunnelProfile } else { [string]$tunnelConfig.profile_name }
+if ([string]::IsNullOrWhiteSpace($effectiveProfile) -or $effectiveProfile -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
+    throw "Invalid tunnel profile name '$effectiveProfile'."
+}
+
+$effectiveProfileDir = $null
+if (-not [string]::IsNullOrWhiteSpace($ProfileDir)) {
+    if ($ProfileDir.IndexOf([char]0) -ge 0) { throw 'Invalid -ProfileDir.' }
+    $trimmedDir = $ProfileDir.Trim()
+    if ($trimmedDir.StartsWith('~') -or $trimmedDir -match '\A[\\/]{2}' -or $trimmedDir -match '\A[A-Za-z]:(?![\\/])') {
+        throw "Refusing unsupported -ProfileDir: $ProfileDir"
+    }
+    $psCwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    $effectiveProfileDir = if ([System.IO.Path]::IsPathFullyQualified($trimmedDir)) {
+        [System.IO.Path]::GetFullPath($trimmedDir)
+    } else {
+        [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($psCwd, $trimmedDir))
+    }
+} elseif ($null -ne $tunnelConfig -and $null -ne $tunnelConfig.PSObject.Properties['profile_dir'] -and -not [string]::IsNullOrWhiteSpace([string]$tunnelConfig.profile_dir)) {
+    $effectiveProfileDir = [string]$tunnelConfig.profile_dir
+}
+
+$tcExe = $null
+if (-not [string]::IsNullOrWhiteSpace($TunnelClientPath)) {
+    if ($TunnelClientPath.IndexOf([char]0) -ge 0) { throw 'Invalid -TunnelClientPath.' }
+    $trimmed = $TunnelClientPath.Trim()
+    if ($trimmed.StartsWith('~') -or $trimmed -match '\A[\\/]{2}' -or $trimmed -match '\A[A-Za-z]:(?![\\/])') {
+        throw "Refusing unsupported -TunnelClientPath: $TunnelClientPath"
+    }
+    $psCwd = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    $tcExe = if ([System.IO.Path]::IsPathFullyQualified($trimmed)) {
+        [System.IO.Path]::GetFullPath($trimmed)
+    } else {
+        [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($psCwd, $trimmed))
+    }
+    if (-not (Test-Path -LiteralPath $tcExe -PathType Leaf)) {
+        throw "tunnel-client not found: $tcExe"
+    }
+} elseif ($null -ne $tunnelConfig -and $null -ne $tunnelConfig.PSObject.Properties['tunnel_client_path'] -and (Test-Path -LiteralPath ([string]$tunnelConfig.tunnel_client_path) -PathType Leaf)) {
+    $tcExe = [string]$tunnelConfig.tunnel_client_path
+} else {
+    $cmd = Get-Command -Name 'tunnel-client' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $cmd) {
+        throw 'tunnel-client was not found on PATH. Pass -TunnelClientPath or re-run .\setup-tunnel.ps1.'
+    }
+    $tcExe = $cmd.Source
+}
+
+$runArgs = [System.Collections.Generic.List[string]]::new()
+$runArgs.Add('run')
+$runArgs.Add('--profile')
+$runArgs.Add($effectiveProfile)
+if (-not [string]::IsNullOrWhiteSpace($effectiveProfileDir)) {
+    $runArgs.Add('--profile-dir')
+    $runArgs.Add($effectiveProfileDir)
+}
+
+& $tcExe @runArgs
+exit $LASTEXITCODE
+'@
+
     $generatedFiles = @(
         @{ Path = $existingInstallJsonPath; Content = ($installConfig | ConvertTo-Json -Depth 4) + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'start.ps1'); Content = $startContent + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'status.ps1'); Content = $statusContent + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'apply.ps1'); Content = $applyContent + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'rollback.ps1'); Content = $rollbackContent + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'setup-tunnel.ps1'); Content = $setupTunnelContent + "`n" },
+        @{ Path = (Join-Path $resolvedInstallDir 'start-tunnel.ps1'); Content = $startTunnelContent + "`n" },
         @{ Path = (Join-Path $resolvedInstallDir 'start-worker.ps1'); Content = $startWorkerContent + "`n" },
         @{ Path = (Join-Path $resolvedInstallDir 'setup-worker.ps1'); Content = $setupWorkerContent + "`n" },
         @{ Path = (Join-Path $resolvedInstallDir 'new-grant.ps1'); Content = $newGrantContent + "`n" },
@@ -848,17 +1483,18 @@ exit $LASTEXITCODE
         Write-Output 'Optional: Git for Windows was not found at C:\Program Files\Git\cmd\git.exe or on PATH (needed only for the Git read tools; test runs do not require it). Install: winget install --id Git.Git  (https://git-scm.com/download/win)'
     }
     Write-Output ''
-    Write-Output 'Next: open PowerShell 7 in the install folder and run these scripts in order:'
-    Write-Output '  1. .\environment-check.ps1   (lists persistent environment entries that look like credentials)'
-    Write-Output '  2. .\new-grant.ps1           (creates a pro-review grant by default; pass -Profile pro-agent for _pro\work\ editing)'
+    Write-Output 'Next: open PowerShell 7 in the install folder:'
     if (-not $canBuildRuntime) {
-        Write-Output '  3. Install the missing items above, open a new PowerShell 7 window, and run .\setup-worker.ps1'
-        Write-Output '  4. .\start-worker.ps1        (starts the local worker that runs queued tests; --allow-work-exec is off by default)'
+        Write-Output '  1. .\start.ps1             (checks environment and creates a 4-hour pro-agent grant; run .\setup-worker.ps1 after installing the missing items above to enable test runs)'
     } elseif ($missingTestRunPrereqs.Count -gt 0) {
-        Write-Output '  3. Install the missing items above, open a new PowerShell 7 window, and run .\start-worker.ps1'
+        Write-Output '  1. .\start.ps1             (checks environment, creates a 4-hour pro-agent grant, and starts the worker; install the missing items above before running tests)'
     } else {
-        Write-Output '  3. .\start-worker.ps1        (starts the local worker that runs queued tests; --allow-work-exec is off by default)'
+        Write-Output '  1. .\start.ps1             (checks environment, creates a 4-hour pro-agent grant, and starts the local worker; --allow-work-exec is off by default)'
     }
+    Write-Output '  2. .\setup-tunnel.ps1      (for ChatGPT web: creates and checks the tunnel-client profile, then start it with .\start-tunnel.ps1)'
+    Write-Output '  3. .\apply.ps1 <workspace> (previews a workspace diff, asks y/N, applies atomically, and prints the .\rollback.ps1 command)'
+    Write-Output ''
+    Write-Output 'Run .\status.ps1 at any time to check versions, prerequisites, and _pro\ workspaces/outputs.'
     Write-Output ''
     Write-Output 'For an MCP client that starts a local program (stdio), configure:'
     Write-Output "  Program  : $installedExe"
@@ -866,9 +1502,7 @@ exit $LASTEXITCODE
     Write-Output '             mcp'
     Write-Output '             --principal=executor:default'
     Write-Output ''
-    Write-Output 'ChatGPT web cannot start a local program. It needs a tunnel and a connector that you set up yourself; this installer does not set them up.'
-    Write-Output ''
-    Write-Output 'Boundary rule: under pro-review, the remote model creates new files only under _pro\ (never _pro\inbox\). Under pro-agent, it can also edit copies inside _pro\work\<workspace>\ and export diffs; project files stay read-only until you run edge-bridge work-apply --confirm.'
+    Write-Output 'Boundary rule: under pro-review, the remote model creates new files only under _pro\ (never _pro\inbox\). Under pro-agent, it can also edit copies inside _pro\work\<workspace>\ and export diffs; project files stay read-only until you run .\apply.ps1 <workspace>.'
 } catch {
     $originalError = $_
     if (-not $installCommitted) {

@@ -15,7 +15,18 @@ def run(request):
     sys.path.insert(0, sys.argv[1])
     from edge_bridge.broker import protected_path, require_state_writer_token, setup_state
     from edge_bridge.jobs import (
-        COMMAND, Jobs, POWERSHELL_PREFIX, PROJECT_TEST_COMMAND, _seal_snapshot, validate_project_test_files,
+        COMMAND,
+        Jobs,
+        POWERSHELL_PREFIX,
+        POWERSHELL_SNAPSHOT_MAX_FILE_BYTES,
+        POWERSHELL_SNAPSHOT_MAX_FILES,
+        POWERSHELL_SNAPSHOT_MAX_TOTAL_BYTES,
+        PROJECT_TEST_COMMAND,
+        PYTHON_SNAPSHOT_MAX_FILE_BYTES,
+        PYTHON_SNAPSHOT_MAX_FILES,
+        PYTHON_SNAPSHOT_MAX_TOTAL_BYTES,
+        _seal_snapshot,
+        validate_project_test_files,
     )
     from edge_bridge import runner
     from edge_bridge.state import State
@@ -30,19 +41,19 @@ def run(request):
         if sys.stdin.buffer.readline(16) != b"start\n":
             raise runner.RunnerBlocked("QUEUE_LAUNCH_DENIED", "The owner did not authorize workload creation.")
     is_work = False
-    max_files = 32
-    max_total_bytes = 524_288
-    max_file_bytes = 65_536
     cpu_percent = None
     if request["recipe"] == "python_tests":
         runtime = "python"
+        max_files = PYTHON_SNAPSHOT_MAX_FILES
+        max_total_bytes = PYTHON_SNAPSHOT_MAX_TOTAL_BYTES
+        max_file_bytes = PYTHON_SNAPSHOT_MAX_FILE_BYTES
         command = PROJECT_TEST_COMMAND
     elif request["recipe"] == "python_tests_work":
         is_work = True
         runtime = "python"
-        max_files = 128
-        max_total_bytes = 4 * 1024 * 1024
-        max_file_bytes = 256 * 1024
+        max_files = PYTHON_SNAPSHOT_MAX_FILES
+        max_total_bytes = PYTHON_SNAPSHOT_MAX_TOTAL_BYTES
+        max_file_bytes = PYTHON_SNAPSHOT_MAX_FILE_BYTES
         test_target = request.get("test_target")
         if test_target is not None:
             validated_target = runner._validate_test_target(test_target)
@@ -58,6 +69,9 @@ def run(request):
             raise runner.RunnerBlocked("INVALID_GRANT_LIMITS", "Work runs require a valid max_cpu_percent between 1 and 50.")
     elif request["recipe"] == "powershell_script":
         runtime = "powershell"
+        max_files = POWERSHELL_SNAPSHOT_MAX_FILES
+        max_total_bytes = POWERSHELL_SNAPSHOT_MAX_TOTAL_BYTES
+        max_file_bytes = POWERSHELL_SNAPSHOT_MAX_FILE_BYTES
         command = (*POWERSHELL_PREFIX, files[0])
     elif request["recipe"] == "powershell_script_work":
         raise runner.RunnerBlocked("POWERSHELL_SCRIPT_WORK_UNSUPPORTED", "Recipe 'powershell_script_work' is not supported.")
@@ -80,7 +94,7 @@ def run(request):
     setup_state(state_path)
     state = State(state_path / "state.sqlite3")
     project = state.register_project(source["root"], "Rust queued test snapshot", source["root_identity"])
-    if is_work:
+    if runtime == "python":
         state.set_exec_policy(project["project_id"], max_files=max_files, max_total_bytes=max_total_bytes)
     state.set_test_scope(project["project_id"], runtime, approved)
     delegated = bool(request["delegated"])
@@ -172,12 +186,16 @@ def run(request):
         }
     else:
         provenance = None
+    failure_code = evidence.get("failure_code")
+    diagnostic = evidence.get("diagnostic_hint")
+    if failure_code == "RESOURCE_BUDGET_EXCEEDED" and diagnostic:
+        failure_code = f"{failure_code}: {diagnostic}"
     return {
         "job_id": job_id,
         "status": job["status"],
         "exit_code": job["exit_code"],
-        "failure_code": evidence.get("failure_code"),
-        "diagnostic": evidence.get("diagnostic_hint"),
+        "failure_code": failure_code,
+        "diagnostic": diagnostic,
         "mxc_verified": verified,
         "workload_started": workload_started,
         "policy_sha256": policy.get("profile_sha256") if verified else None,
@@ -198,7 +216,13 @@ try:
     request = json.loads(request_line)
     response = run(request)
 except Exception as error:
-    response = {"status": "failed", "failure_code": getattr(error, "code", type(error).__name__)}
-    if response["failure_code"] in {"ISOLATION_NOT_VERIFIED", "STATE_TOKEN_OWNER_MISMATCH"}:
+    code = getattr(error, "code", type(error).__name__)
+    detail = str(error).strip()
+    if code in {"RESOURCE_BUDGET_EXCEEDED", "INVALID_TEST_SCOPE"} and detail:
+        failure_code = detail if detail.startswith(f"{code}:") else f"{code}: {detail}"
+    else:
+        failure_code = code
+    response = {"status": "failed", "failure_code": failure_code}
+    if code in {"ISOLATION_NOT_VERIFIED", "STATE_TOKEN_OWNER_MISMATCH"}:
         response["diagnostic"] = str(error)
 print(json.dumps(response, ensure_ascii=True), flush=True)

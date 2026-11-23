@@ -332,11 +332,32 @@ while True:
 
     def test_payload_command_and_recipe_details_validate_test_target(self):
         with tempfile.TemporaryDirectory() as temporary:
-            work = Path(temporary)
+            root = Path(temporary)
+            work_with_init = root / "with_init"
+            (work_with_init / "tests").mkdir(parents=True)
+            (work_with_init / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            work_no_init = root / "no_init"
+            (work_no_init / "tests").mkdir(parents=True)
+
+            # Discovery command matches PROJECT_TEST_ARGS when tests/__init__.py exists,
+            # and uses the no-init discovery shim (keeping -I -S -B) when absent.
+            cmd_with_init = runner._payload_command(work_with_init, "project_tests")
+            self.assertEqual(cmd_with_init[-len(runner.PROJECT_TEST_ARGS):], list(runner.PROJECT_TEST_ARGS))
+            cmd_no_init = runner._payload_command(work_no_init, "project_tests")
+            self.assertEqual(
+                cmd_no_init[-9:],
+                ["-I", "-S", "-B", "-c", runner._PROJECT_TEST_NO_INIT_DISCOVER_SHIM, "discover", "-s", "tests", "-v"],
+            )
+
             for target in ("tests.test_calc", "tests.test_calc.CalcTests", "tests.test_calc.CalcTests.test_add"):
                 with self.subTest(valid_target=target):
-                    cmd = runner._payload_command(work, "project_tests", test_target=target)
-                    self.assertEqual(cmd[-3:], [runner._PROJECT_TEST_TARGET_SHIM, target, "-v"])
+                    cmd_init = runner._payload_command(work_with_init, "project_tests", test_target=target)
+                    self.assertEqual(cmd_init[-3:], [runner._PROJECT_TEST_TARGET_SHIM, target, "-v"])
+                    cmd_plain = runner._payload_command(work_no_init, "project_tests", test_target=target)
+                    self.assertEqual(
+                        cmd_plain[-3:],
+                        [runner._PROJECT_TEST_NO_INIT_TARGET_SHIM, target.removeprefix("tests."), "-v"],
+                    )
                     self.assertEqual(
                         _recipe_details("python", [*COMMAND, target], "."),
                         ("project_tests", None, target),
@@ -356,11 +377,89 @@ while True:
             ):
                 with self.subTest(bad_target=bad):
                     with self.assertRaises(runner.RunnerBlocked) as err:
-                        runner._payload_command(work, "project_tests", test_target=bad)
+                        runner._payload_command(work_with_init, "project_tests", test_target=bad)
                     self.assertEqual(err.exception.code, "INVALID_ARGUMENT")
                     with self.assertRaises(JobError) as jerr:
                         _recipe_details("python", [*COMMAND, bad], ".")
                     self.assertEqual(jerr.exception.code, "EXECUTION_REQUEST_UNSUPPORTED")
+
+    def test_python_discovery_and_selector_execute_in_both_layouts_with_isolated_flags(self):
+        import subprocess
+
+        def run_payload(work: Path, test_target: str | None = None):
+            full = runner._payload_command(work, "project_tests", test_target=test_target)
+            py_cmd = full[full.index("--") + 1:]
+            self.assertEqual(py_cmd[1:4], ["-I", "-S", "-B"])
+            return subprocess.run(py_cmd, cwd=work, capture_output=True, encoding="utf-8", timeout=20)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Layout 1: NO tests/__init__.py, 79 files including a 136 KiB module and 89 tests.
+            no_init = root / "no_init"
+            (no_init / "pkg").mkdir(parents=True)
+            (no_init / "tests").mkdir(parents=True)
+            big_text = "VALUE = 42\n# " + ("a" * (136 * 1024 - 20)) + "\n"
+            (no_init / "pkg" / "big_mod.py").write_text(big_text, encoding="utf-8")
+            (no_init / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+            for idx in range(74):
+                (no_init / "pkg" / f"m_{idx:02d}.py").write_text(f"N = {idx}\n", encoding="utf-8")
+            (no_init / "tests" / "helper.py").write_text("OFFSET = 8\n", encoding="utf-8")
+            methods = "\n".join(
+                f"    def test_case_{idx:02d}(self): self.assertEqual(big_mod.VALUE + helper.OFFSET, 50)"
+                for idx in range(88)
+            )
+            (no_init / "tests" / "test_suite.py").write_text(
+                "import unittest\nfrom pkg import big_mod\nimport helper\n"
+                f"class SuiteTests(unittest.TestCase):\n{methods}\n",
+                encoding="utf-8",
+            )
+            (no_init / "tests" / "test_extra.py").write_text(
+                "import unittest\nfrom pkg import big_mod\n"
+                "class ExtraTests(unittest.TestCase):\n"
+                "    def test_one(self): self.assertEqual(big_mod.VALUE, 42)\n",
+                encoding="utf-8",
+            )
+            # Validate all 79 files with default python snapshot limits (no tests/__init__.py).
+            pf = ProjectFiles(str(no_init))
+            rel_files = sorted(p.relative_to(no_init).as_posix() for p in no_init.rglob("*.py"))
+            self.assertEqual(len(rel_files), 79)
+            validated = validate_project_test_files(
+                {"root": str(no_init), "root_identity": pf.root_identity}, "python", rel_files,
+            )
+            self.assertEqual(validated, rel_files)
+
+            proc_all = run_payload(no_init)
+            self.assertEqual(proc_all.returncode, 0, proc_all.stdout + proc_all.stderr)
+            self.assertIn("Ran 89 tests", proc_all.stdout + proc_all.stderr)
+            self.assertFalse((no_init / "tests" / "__init__.py").exists())
+
+            proc_mod = run_payload(no_init, test_target="tests.test_extra")
+            self.assertEqual(proc_mod.returncode, 0, proc_mod.stdout + proc_mod.stderr)
+            self.assertIn("Ran 1 test", proc_mod.stdout + proc_mod.stderr)
+
+            proc_method = run_payload(no_init, test_target="tests.test_suite.SuiteTests.test_case_00")
+            self.assertEqual(proc_method.returncode, 0, proc_method.stdout + proc_method.stderr)
+            self.assertIn("Ran 1 test", proc_method.stdout + proc_method.stderr)
+            self.assertFalse((no_init / "tests" / "__init__.py").exists())
+
+            # Layout 2: WITH tests/__init__.py keeps exact existing discovery and selector behavior.
+            with_init = root / "with_init"
+            (with_init / "tests").mkdir(parents=True)
+            (with_init / "app.py").write_text("X = 7\n", encoding="utf-8")
+            (with_init / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            (with_init / "tests" / "test_app.py").write_text(
+                "import unittest\nfrom app import X\n"
+                "class AppTests(unittest.TestCase):\n"
+                "    def test_a(self): self.assertEqual(X, 7)\n"
+                "    def test_b(self): self.assertEqual(X + 1, 8)\n",
+                encoding="utf-8",
+            )
+            p_all = run_payload(with_init)
+            self.assertEqual(p_all.returncode, 0, p_all.stdout + p_all.stderr)
+            self.assertIn("Ran 2 tests", p_all.stdout + p_all.stderr)
+            p_one = run_payload(with_init, test_target="tests.test_app.AppTests.test_a")
+            self.assertEqual(p_one.returncode, 0, p_one.stdout + p_one.stderr)
+            self.assertIn("Ran 1 test", p_one.stdout + p_one.stderr)
 
     def test_work_snapshot_limits_and_hardlink_refusal(self):
         import os
@@ -393,7 +492,7 @@ while True:
             self.assertEqual(len(sealed), 3)
             self.assertEqual(sealed[0]["sha256"], hashlib.sha256(big_ok.encode("utf-8")).hexdigest())
 
-            # Single file > 256 KiB is refused.
+            # Single file > 256 KiB is refused with filename, measured size, and limit.
             (work / "too_big.py").write_text("b" * (256 * 1024 + 1), encoding="utf-8")
             with self.assertRaises(JobError) as err:
                 validate_project_test_files(
@@ -405,9 +504,12 @@ while True:
                     max_file_bytes=256 * 1024,
                 )
             self.assertEqual(err.exception.code, "RESOURCE_BUDGET_EXCEEDED")
+            self.assertIn("too_big.py", str(err.exception))
+            self.assertIn("262145", str(err.exception))
+            self.assertIn("262144", str(err.exception))
             (work / "too_big.py").unlink()
 
-            # > 128 files is refused.
+            # > 128 files is refused with measured count and limit.
             with self.assertRaises(JobError) as err:
                 validate_project_test_files(
                     project,
@@ -418,6 +520,41 @@ while True:
                     max_file_bytes=256 * 1024,
                 )
             self.assertEqual(err.exception.code, "INVALID_TEST_SCOPE")
+            self.assertIn("129", str(err.exception))
+            self.assertIn("128", str(err.exception))
+
+            # Total bytes > 4 MiB is refused with measured total and limit.
+            bulk = "c" * (250 * 1024)
+            bulk_files = []
+            for idx in range(17):
+                name = f"bulk_{idx:02d}.py"
+                (work / name).write_text(bulk, encoding="utf-8")
+                bulk_files.append(name)
+            try:
+                with self.assertRaises(JobError) as total_err:
+                    validate_project_test_files(
+                        project,
+                        "python",
+                        ["tests/test_ok.py", *bulk_files],
+                    )
+                self.assertEqual(total_err.exception.code, "RESOURCE_BUDGET_EXCEEDED")
+                self.assertIn("total size", str(total_err.exception))
+                self.assertIn("4194304", str(total_err.exception))
+            finally:
+                for name in bulk_files:
+                    (work / name).unlink()
+
+            # PowerShell script limit stays at 64 KiB and reports measured size on refusal.
+            (work / "big.ps1").write_text("#" * (65_536 + 1), encoding="utf-8")
+            try:
+                with self.assertRaises(JobError) as ps_err:
+                    validate_project_test_files(project, "powershell", ["big.ps1"])
+                self.assertEqual(ps_err.exception.code, "RESOURCE_BUDGET_EXCEEDED")
+                self.assertIn("big.ps1", str(ps_err.exception))
+                self.assertIn("65537", str(ps_err.exception))
+                self.assertIn("65536", str(ps_err.exception))
+            finally:
+                (work / "big.ps1").unlink()
 
             # Hardlink inside workspace is refused with UNSUPPORTED_PATH_TYPE.
             outside_target = root / "outside.py"
@@ -494,4 +631,34 @@ while True:
                     self.assertEqual(rc, 0)
                     self.assertEqual(rec["status"], "failed")
                     self.assertEqual(rec["failure_code"], "INVALID_GRANT_LIMITS")
+
+            # queued_mxc.py keeps powershell_script capped at 64 KiB and reports measured size in failure_code.
+            (proj / "oversize.ps1").write_text("#" * (65_536 + 1), encoding="utf-8")
+            rc, rec = invoke({
+                **base_req,
+                "run_id": "ps_over_64k",
+                "recipe": "powershell_script",
+                "files": ["oversize.ps1"],
+            })
+            self.assertEqual(rc, 0)
+            self.assertEqual(rec["status"], "failed")
+            self.assertTrue(rec["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), rec)
+            self.assertIn("oversize.ps1", rec["failure_code"])
+            self.assertIn("65537", rec["failure_code"])
+            self.assertIn("65536", rec["failure_code"])
+
+            # queued_mxc.py reports measured size for python_tests file > 256 KiB.
+            (proj / "oversize.py").write_text("x" * (256 * 1024 + 1), encoding="utf-8")
+            rc, rec = invoke({
+                **base_req,
+                "run_id": "py_over_256k",
+                "recipe": "python_tests",
+                "files": ["oversize.py", "tests/test_ok.py"],
+            })
+            self.assertEqual(rc, 0)
+            self.assertEqual(rec["status"], "failed")
+            self.assertTrue(rec["failure_code"].startswith("RESOURCE_BUDGET_EXCEEDED:"), rec)
+            self.assertIn("oversize.py", rec["failure_code"])
+            self.assertIn("262145", rec["failure_code"])
+            self.assertIn("262144", rec["failure_code"])
 

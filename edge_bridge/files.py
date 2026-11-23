@@ -716,12 +716,17 @@ class ProjectFiles:
         if type(max_bytes) is not int or not 1 <= max_bytes <= 256 * 1024:
             _fail("INVALID_ARGUMENT", "Snapshot file size limit must be between 1 and 262144 bytes.")
         parts = _parts(path)
+        rel_path = "/".join(parts)
         with self._directory(parts[:-1]) as handle, _open(handle, parts[-1]) as (child, info):
             if info.size > max_bytes:
-                _fail("RESOURCE_BUDGET_EXCEEDED", "Snapshot file exceeds its per-file byte limit.")
+                _fail(
+                    "RESOURCE_BUDGET_EXCEEDED",
+                    f"snapshot file '{rel_path}' size {info.size} bytes exceeds {max_bytes} bytes.",
+                    {"path": rel_path, "size": info.size, "max_bytes": max_bytes},
+                )
             result = _read_window_and_hash(child, info, 0, max_bytes, lossy_utf8=False)
         return {
-            "path": "/".join(parts), "content": result["content"], "hash": result["hash"],
+            "path": rel_path, "content": result["content"], "hash": result["hash"],
             "encoding": result["encoding"], "editable": result["editable"],
             "size": result["size"], "offset": 0, "next_offset": None, "truncated": False,
         }

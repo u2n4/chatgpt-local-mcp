@@ -23,8 +23,8 @@ use crate::queued_mxc_evidence::{self, EvidenceError, QueuedRunEvidence};
 
 // Keep these in sync with the Python supervisor's request and scope validation.
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
-const MAX_SNAPSHOT_FILES: usize = 32;
-const WORK_MAX_SNAPSHOT_FILES: usize = bridge_core::work::WORK_EXEC_MAX_SNAPSHOT_FILES;
+const PYTHON_MAX_SNAPSHOT_FILES: usize = bridge_core::work::PYTHON_SNAPSHOT_MAX_FILES;
+const POWERSHELL_MAX_SNAPSHOT_FILES: usize = 32;
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const MAX_CHUNK_BYTES: usize = 4096;
 const WORKER_TIMEOUT_SECS: u64 = 60;
@@ -354,13 +354,14 @@ fn exportable_metadata(run: &DurableJobRecord, files: &[String]) -> bool {
         .all(|value| scan_and_redact_secrets(value).clean)
 }
 
-/// Collect the test inputs: `.py` and `.json` files up to six folders deep, at most 200 entries.
+/// Collect the test inputs: `.py` and `.json` files up to six folders deep, sharing the Python
+/// snapshot budgets (128 files, 256 KiB per file, 4 MiB total, 1,000 visible entries).
 /// A folder the requester can write into is neither entered nor counted, so nothing placed there
 /// can run or use up the budget.
 fn discover_python_scope(source: &ScopedFiles, requester_writable: &[String]) -> Result<Vec<String>, BridgeError> {
-    let mut files = Vec::new();
-    let mut seen = 0;
-    let mut pending = vec![(".".to_string(), 1)];
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    let mut seen = 0usize;
+    let mut pending = vec![(".".to_string(), 1usize)];
     while let Some((folder, depth)) = pending.pop() {
         // A folder whose path is not a valid project path (too long, or a name Windows treats
         // specially) cannot hold a file with a valid one, so it is passed over. Any other
@@ -386,17 +387,16 @@ fn discover_python_scope(source: &ScopedFiles, requester_writable: &[String]) ->
                     continue;
                 }
                 seen += 1;
-                if seen > 200 {
-                    return Err(BridgeError::new(ErrorCode::ResourceBudgetExceeded,
-                        "Python discovery exceeded 200 project entries.", bridge_types::OriginLayer::JobRunner));
+                if seen > bridge_core::work::PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES {
+                    return Err(bridge_core::work::snapshot_entry_limit_error(seen));
                 }
                 let hidden = entry.path.split('/').any(|part| part.starts_with('.'));
                 if is_folder {
-                    if depth < 6 {
+                    if depth < bridge_core::work::PYTHON_SNAPSHOT_MAX_DEPTH {
                         pending.push((entry.path, depth + 1));
                     }
                 } else if !hidden && (entry.path.ends_with(".py") || entry.path.ends_with(".json")) {
-                    files.push(entry.path);
+                    candidates.push((entry.path, entry.size));
                 }
             }
             match next {
@@ -405,8 +405,9 @@ fn discover_python_scope(source: &ScopedFiles, requester_writable: &[String]) ->
             }
         }
     }
-    files.sort();
-    Ok(files)
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    bridge_core::work::check_python_snapshot_limits(&candidates)?;
+    Ok(candidates.into_iter().map(|(path, _)| path).collect())
 }
 
 /// A run for a remote requester may not copy what that requester may not read.
@@ -428,7 +429,14 @@ fn reject_authorization(store: &StateStore, run_id: &RunId, error: BridgeError) 
         | ErrorCode::UnsupportedPathType | ErrorCode::FileNotFound | ErrorCode::PathOutsideRoot => {
             deny_request(store, run_id, &error.to_string())
         }
-        ErrorCode::ResourceBudgetExceeded => deny_request(store, run_id, "RESOURCE_BUDGET_EXCEEDED"),
+        ErrorCode::ResourceBudgetExceeded => {
+            let reason = if error.message.starts_with("RESOURCE_BUDGET_EXCEEDED") {
+                error.message
+            } else {
+                format!("RESOURCE_BUDGET_EXCEEDED: {}", error.message)
+            };
+            deny_request(store, run_id, &reason)
+        }
         _ => Err(error.into()),
     }
 }
@@ -473,7 +481,11 @@ pub fn run(
     let project = store.get_project(&existing.project_id.0, &Principal::Local)?;
     let (runtime, python) = trusted_runtime(state, runtime)?;
     verify_project_roots(&project, state, &runtime)?;
-    ensure!((2..=32).contains(&files.len()), "Supply between two and 32 approved test files");
+    ensure!(
+        (1..=PYTHON_MAX_SNAPSHOT_FILES).contains(&files.len()),
+        "Supply between one and {PYTHON_MAX_SNAPSHOT_FILES} approved test files (got {})",
+        files.len()
+    );
     let files = check_snapshot_paths(files, false)?;
     retry_busy(|| store.admit_local_python_tests(&run_id, host))?;
     let result = supervise_with_cpu_cap(store, state, &existing, &runtime, &python, &project,
@@ -565,13 +577,13 @@ fn hide_host_paths(text: &str, workspace: &Path, run_dir: &Path) -> String {
     out
 }
 
-fn frame_request(request: &Value) -> Result<Option<Vec<u8>>> {
+fn frame_request(request: &Value) -> Result<std::result::Result<Vec<u8>, usize>> {
     let mut bytes = serde_json::to_vec(request)?;
     if bytes.len() >= MAX_REQUEST_BYTES {
-        return Ok(None);
+        return Ok(Err(bytes.len() + 1));
     }
     bytes.push(b'\n');
-    Ok(Some(bytes))
+    Ok(Ok(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,13 +630,33 @@ fn supervise_in_job(
     let ready_path = output.join("mxc-supervisor.pid");
     let cancel_path = output.join("mxc-cancel");
     let launch_ready = output.join("mxc-launch-ready");
-    let max_files = if recipe.work_copy.is_some() { WORK_MAX_SNAPSHOT_FILES } else { MAX_SNAPSHOT_FILES };
+    let max_files = if matches!(recipe.name, "python_tests" | "python_tests_work") {
+        PYTHON_MAX_SNAPSHOT_FILES
+    } else {
+        POWERSHELL_MAX_SNAPSHOT_FILES
+    };
     if recipe.files.len() > max_files {
-        return deny_request(store, run_id, "RESOURCE_BUDGET_EXCEEDED");
+        return deny_request(
+            store,
+            run_id,
+            &format!(
+                "RESOURCE_BUDGET_EXCEEDED: snapshot file count {} exceeds {max_files}.",
+                recipe.files.len()
+            ),
+        );
     }
     let request = build_supervisor_request(&backend_state, project, &recipe, &cancel_path, run_id, &launch_ready, limits);
-    let Some(request) = frame_request(&request)? else {
-        return deny_request(store, run_id, "RESOURCE_BUDGET_EXCEEDED");
+    let request = match frame_request(&request)? {
+        Ok(bytes) => bytes,
+        Err(measured) => {
+            return deny_request(
+                store,
+                run_id,
+                &format!(
+                    "RESOURCE_BUDGET_EXCEEDED: supervisor request size {measured} bytes exceeds {MAX_REQUEST_BYTES} bytes."
+                ),
+            );
+        }
     };
     let mut command = Command::new(python);
     command.args(["-I", "-B", "-c", include_str!("queued_mxc.py")])
@@ -1042,7 +1074,7 @@ mod tests {
         assert_eq!(line.len(), MAX_REQUEST_BYTES);
         assert_eq!(line.last(), Some(&b'\n'));
         let too_long = json!("x".repeat(MAX_REQUEST_BYTES - 2));
-        assert!(frame_request(&too_long).unwrap().is_none());
+        assert_eq!(frame_request(&too_long).unwrap(), Err(MAX_REQUEST_BYTES + 1));
     }
 
     #[test]
@@ -1637,5 +1669,152 @@ mod tests {
             assert_eq!(discovered, vec!["calc.py", "tests/__init__.py", "tests/test_calc.py"]);
             assert!(discovered.iter().all(|p| !p.starts_with("_pro")));
         }
+    }
+
+    #[test]
+    fn python_tests_shared_limits_no_init_discovery_and_detailed_refusal_messages() {
+        use bridge_core::policy::{PRO_AGENT_CATEGORIES, PRO_AGENT_RECIPES, PRO_REVIEW_CATEGORIES, PRO_REVIEW_RECIPES, PRO_REVIEW_WRITABLE_PATH};
+        use bridge_core::work::{
+            PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES, PYTHON_SNAPSHOT_MAX_FILES,
+            PYTHON_SNAPSHOT_MAX_FILE_BYTES, PYTHON_SNAPSHOT_MAX_TOTAL_BYTES,
+        };
+        use std::cell::Cell;
+
+        let base = std::env::temp_dir().join(format!("eb_py_limits_{}", uuid::Uuid::new_v4().simple()));
+        let _cleanup = TempCleanup(base.clone());
+        let clean_env = || Some(vec![("PATH".to_string(), Some("C:\\Windows".to_string()))]);
+
+        // 1. 79-file project with a 136 KiB module, no tests/__init__.py, oversized hidden secrets.json,
+        //    and >1,000 files under _pro/reports/ passes discovery cleanly.
+        {
+            let root = base.join("ok_79");
+            fs::create_dir_all(root.join("pkg")).unwrap();
+            fs::create_dir_all(root.join("tests")).unwrap();
+            fs::create_dir_all(root.join("_pro/reports")).unwrap();
+            let big_136k = format!("DATA = '{}'\n", "x".repeat(136 * 1024 - 10));
+            fs::write(root.join("pkg/big_module.py"), &big_136k).unwrap();
+            for i in 0..76 {
+                fs::write(root.join(format!("pkg/mod_{i:02}.py")), format!("N = {i}\n")).unwrap();
+            }
+            fs::write(root.join("tests/test_a.py"), "import unittest\n").unwrap();
+            fs::write(root.join("tests/test_b.py"), "import unittest\n").unwrap();
+            // Oversized hidden file (>256 KiB) must be skipped and never trip the size budget.
+            fs::write(root.join("secrets.json"), vec![b's'; (PYTHON_SNAPSHOT_MAX_FILE_BYTES as usize) + 50_000]).unwrap();
+            // >1,000 files in _pro/ must be skipped and never trip the entry or file-count budget.
+            for i in 0..1_050 {
+                fs::write(root.join(format!("_pro/reports/r_{i:04}.json")), "{}\n").unwrap();
+            }
+            let source = ScopedFiles::new(&root, None).unwrap();
+            let discovered = discover_python_scope(&source, &[PRO_REVIEW_WRITABLE_PATH.to_owned()]).unwrap();
+            assert_eq!(discovered.len(), 79);
+            assert!(discovered.contains(&"pkg/big_module.py".to_string()));
+            assert!(!discovered.contains(&"tests/__init__.py".to_string()));
+            assert!(discovered.iter().all(|p| !p.starts_with("_pro") && !p.contains("secrets.json")));
+            assert!(!root.join("tests/__init__.py").exists());
+        }
+
+        // 2. Over each snapshot limit is refused by process_request_with_hooks with limit + measured value.
+        let run_limit_case = |label: &str, setup: &dyn Fn(&Path)| -> (Value, String) {
+            let dir = base.join(label);
+            let (store, host, project, grant, state_dir, runtime_dir) = setup_work_exec_fixture(
+                &dir,
+                PRO_REVIEW_CATEGORIES.to_vec(),
+                vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+                PRO_REVIEW_RECIPES.map(str::to_owned).to_vec(),
+                bridge_types::ResourceLimits::default(),
+                false,
+            );
+            setup(Path::new(&project.root));
+            let (run, payload) = queue_and_admit(&store, &host, &project, &grant, &state_dir, "op_lim", "python_tests", vec![]);
+            let res = process_request_with_hooks(
+                &store, &state_dir, &host, &run, &payload, &runtime_dir, &runtime_dir,
+                true, false, clean_env, WinJobObject::set_cpu_hard_cap,
+            ).unwrap();
+            assert_eq!(res["run"]["state"], "failed", "{label}: {res}");
+            assert_eq!(res["verification"], "BLOCKED", "{label}: {res}");
+            assert!(!state_dir.join("runs").join(&run.run_id.0).exists(), "{label}");
+            let chunks = store.read_run_output(&run.run_id.0, 0, 10).unwrap();
+            let stderr: String = chunks.into_iter().filter(|(_, s, _)| s == "stderr").map(|(_, _, t)| t).collect();
+            (res, stderr)
+        };
+
+        // 2a. Per-file size > 256 KiB.
+        let (res_file, err_file) = run_limit_case("over_file_bytes", &|proj| {
+            let mut body = b"NEVER_LEAK_THIS_CONTENT\n".to_vec();
+            body.resize((PYTHON_SNAPSHOT_MAX_FILE_BYTES as usize) + 1, b'z');
+            fs::write(proj.join("huge_mod.py"), &body).unwrap();
+        });
+        let fc = res_file["failure_code"].as_str().unwrap();
+        assert!(fc.starts_with("RESOURCE_BUDGET_EXCEEDED:"), "{fc}");
+        assert!(fc.contains("huge_mod.py") && fc.contains("262145") && fc.contains("262144"), "{fc}");
+        assert!(!fc.contains("NEVER_LEAK_THIS_CONTENT"), "{fc}");
+        assert_eq!(err_file, fc);
+
+        // 2b. File count > 128 (3 base + 137 extra = 140 files).
+        let (res_count, err_count) = run_limit_case("over_file_count", &|proj| {
+            fs::create_dir_all(proj.join("many")).unwrap();
+            for i in 0..137 {
+                fs::write(proj.join(format!("many/f_{i:03}.py")), "X = 1\n").unwrap();
+            }
+        });
+        let fc = res_count["failure_code"].as_str().unwrap();
+        assert!(fc.starts_with("RESOURCE_BUDGET_EXCEEDED:"), "{fc}");
+        assert!(fc.contains("file count 140 exceeds 128"), "{fc}");
+        assert_eq!(err_count, fc);
+
+        // 2c. Total bytes > 4 MiB (17 * 250 KiB = 4,352,000 + small base files).
+        let (res_total, err_total) = run_limit_case("over_total_bytes", &|proj| {
+            fs::create_dir_all(proj.join("bulk")).unwrap();
+            let buf = vec![b'b'; 250 * 1024];
+            for i in 0..17 {
+                fs::write(proj.join(format!("bulk/b_{i:02}.py")), &buf).unwrap();
+            }
+        });
+        let fc = res_total["failure_code"].as_str().unwrap();
+        assert!(fc.starts_with("RESOURCE_BUDGET_EXCEEDED:"), "{fc}");
+        assert!(fc.contains("total size") && fc.contains(&PYTHON_SNAPSHOT_MAX_TOTAL_BYTES.to_string()), "{fc}");
+        assert_eq!(err_total, fc);
+
+        // 2d. Entry count > 1,000 (1,001 .txt files).
+        let (res_entries, err_entries) = run_limit_case("over_entries", &|proj| {
+            fs::create_dir_all(proj.join("entries")).unwrap();
+            for i in 0..=PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES {
+                fs::write(proj.join(format!("entries/e_{i:04}.txt")), "x").unwrap();
+            }
+        });
+        let fc = res_entries["failure_code"].as_str().unwrap();
+        assert!(fc.starts_with("RESOURCE_BUDGET_EXCEEDED:"), "{fc}");
+        assert!(fc.contains("entry count 1001 exceeds 1000"), "{fc}");
+        assert_eq!(err_entries, fc);
+
+        // 3. python_tests_work without tests/__init__.py in the workspace passes discovery and reaches CPU cap.
+        {
+            let dir = base.join("work_no_init");
+            let (store, host, project, grant, state_dir, runtime_dir) = setup_work_exec_fixture(
+                &dir,
+                PRO_AGENT_CATEGORIES.to_vec(),
+                vec![PRO_REVIEW_WRITABLE_PATH.to_owned()],
+                PRO_AGENT_RECIPES.map(str::to_owned).to_vec(),
+                bridge_types::ResourceLimits::default(),
+                true,
+            );
+            fs::remove_file(Path::new(&project.root).join("_pro/work/fix-1/tests/__init__.py")).unwrap();
+            let (run, payload) = queue_and_admit(
+                &store, &host, &project, &grant, &state_dir, "op_no_init_work",
+                "python_tests_work", vec!["fix-1", "tests.test_calc.T.test_ok"],
+            );
+            let reached_cpu_cap = Cell::new(false);
+            let res = process_request_with_hooks(
+                &store, &state_dir, &host, &run, &payload, &runtime_dir, &runtime_dir,
+                false, true, clean_env,
+                |_job, _pct| {
+                    reached_cpu_cap.set(true);
+                    Err(BridgeError::new(ErrorCode::InternalError, "stop before spawn", bridge_types::OriginLayer::JobRunner))
+                },
+            ).unwrap();
+            assert!(reached_cpu_cap.get(), "Expected work run without tests/__init__.py to pass discovery: {res}");
+            assert!(!Path::new(&project.root).join("_pro/work/fix-1/tests/__init__.py").exists());
+        }
+        let _ = PYTHON_SNAPSHOT_MAX_FILES;
     }
 }

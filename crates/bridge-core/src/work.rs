@@ -41,11 +41,66 @@ pub const WORK_EDIT_MAX_CALL_BYTES: usize = 4 * 1024 * 1024;
 
 pub const WORK_DELETE_MAX_PATHS: usize = 64;
 
-pub const WORK_EXEC_MAX_SNAPSHOT_FILES: usize = 128;
-pub const WORK_EXEC_MAX_FILE_BYTES: u64 = 256 * 1024;
-pub const WORK_EXEC_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
-pub const WORK_EXEC_MAX_DISCOVERY_ENTRIES: usize = 1_000;
-pub const WORK_EXEC_MAX_DEPTH: usize = 6;
+pub const PYTHON_SNAPSHOT_MAX_FILES: usize = 128;
+pub const PYTHON_SNAPSHOT_MAX_FILE_BYTES: u64 = 256 * 1024;
+pub const PYTHON_SNAPSHOT_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+pub const PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES: usize = 1_000;
+pub const PYTHON_SNAPSHOT_MAX_DEPTH: usize = 6;
+
+pub const WORK_EXEC_MAX_SNAPSHOT_FILES: usize = PYTHON_SNAPSHOT_MAX_FILES;
+pub const WORK_EXEC_MAX_FILE_BYTES: u64 = PYTHON_SNAPSHOT_MAX_FILE_BYTES;
+pub const WORK_EXEC_MAX_TOTAL_BYTES: u64 = PYTHON_SNAPSHOT_MAX_TOTAL_BYTES;
+pub const WORK_EXEC_MAX_DISCOVERY_ENTRIES: usize = PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES;
+pub const WORK_EXEC_MAX_DEPTH: usize = PYTHON_SNAPSHOT_MAX_DEPTH;
+
+pub fn snapshot_entry_limit_error(measured_entries: usize) -> BridgeError {
+    BridgeError::new(
+        ErrorCode::ResourceBudgetExceeded,
+        format!(
+            "snapshot discovery entry count {measured_entries} exceeds {PYTHON_SNAPSHOT_MAX_DISCOVERY_ENTRIES}."
+        ),
+        OriginLayer::JobRunner,
+    )
+}
+
+/// Validate sorted non-hidden Python snapshot candidates against the shared file size,
+/// file count, and total byte budgets, returning the total byte size when within bounds.
+pub fn check_python_snapshot_limits(candidates: &[(String, u64)]) -> Result<u64, BridgeError> {
+    for (path, size) in candidates {
+        if *size > PYTHON_SNAPSHOT_MAX_FILE_BYTES {
+            return Err(BridgeError::new(
+                ErrorCode::ResourceBudgetExceeded,
+                format!(
+                    "snapshot file '{path}' size {size} bytes exceeds {PYTHON_SNAPSHOT_MAX_FILE_BYTES} bytes."
+                ),
+                OriginLayer::JobRunner,
+            ));
+        }
+    }
+    if candidates.len() > PYTHON_SNAPSHOT_MAX_FILES {
+        return Err(BridgeError::new(
+            ErrorCode::ResourceBudgetExceeded,
+            format!(
+                "snapshot file count {} exceeds {PYTHON_SNAPSHOT_MAX_FILES}.",
+                candidates.len()
+            ),
+            OriginLayer::JobRunner,
+        ));
+    }
+    let total_bytes = candidates
+        .iter()
+        .fold(0u64, |acc, (_, size)| acc.saturating_add(*size));
+    if total_bytes > PYTHON_SNAPSHOT_MAX_TOTAL_BYTES {
+        return Err(BridgeError::new(
+            ErrorCode::ResourceBudgetExceeded,
+            format!(
+                "snapshot total size {total_bytes} bytes exceeds {PYTHON_SNAPSHOT_MAX_TOTAL_BYTES} bytes."
+            ),
+            OriginLayer::JobRunner,
+        ));
+    }
+    Ok(total_bytes)
+}
 
 const WORK_MANIFEST_VERSION: u32 = 1;
 const WORK_MANIFEST_DIR_SCAN_CAP: usize = 512;
@@ -2649,7 +2704,7 @@ fn is_work_test_module_path(path: &str) -> bool {
 /// - refusal of any non-hidden file with `n_links != 1` (hard links),
 /// - silent exclusion of files/folders hidden from remote callers (`is_hidden_from_remote`),
 /// - limits: 128 files, 256 KiB per file, 4 MiB total, 1,000 entries, depth <= 6,
-/// - presence of `tests/__init__.py`, at least one `tests/test_*.py`, and any requested selector module.
+/// - presence of at least one `tests/test_*.py` (`tests/__init__.py` is optional) and any requested selector module.
 pub fn discover_work_python_scope(
     project_root: &Path,
     project_root_identity: &str,
@@ -2743,8 +2798,7 @@ pub fn discover_work_python_scope(
         (ws_verbatim, work_root, work_root_identity)
     };
 
-    let mut files = Vec::new();
-    let mut total_bytes: u64 = 0;
+    let mut candidates: Vec<(String, u64)> = Vec::new();
     let mut entries_scanned: usize = 0;
     let mut stack: Vec<(PathBuf, Vec<String>, usize)> = vec![(ws_verbatim.clone(), Vec::new(), 1)];
 
@@ -2815,13 +2869,7 @@ pub fn discover_work_python_scope(
 
             entries_scanned += 1;
             if entries_scanned > WORK_EXEC_MAX_DISCOVERY_ENTRIES {
-                return Err(BridgeError::new(
-                    ErrorCode::ResourceBudgetExceeded,
-                    format!(
-                        "Work-copy discovery exceeded {WORK_EXEC_MAX_DISCOVERY_ENTRIES} workspace entries."
-                    ),
-                    OriginLayer::JobRunner,
-                ));
+                return Err(snapshot_entry_limit_error(entries_scanned));
             }
 
             let sub_rel = child_parts.join("/");
@@ -2844,35 +2892,7 @@ pub fn discover_work_python_scope(
                 }
                 let dot_hidden = child_parts.iter().any(|part| part.starts_with('.'));
                 if !dot_hidden && (canonical_sub.ends_with(".py") || canonical_sub.ends_with(".json")) {
-                    if size_bytes > WORK_EXEC_MAX_FILE_BYTES {
-                        return Err(BridgeError::new(
-                            ErrorCode::ResourceBudgetExceeded,
-                            format!(
-                                "Work-copy snapshot file exceeds {WORK_EXEC_MAX_FILE_BYTES} bytes limit."
-                            ),
-                            OriginLayer::JobRunner,
-                        ));
-                    }
-                    total_bytes = total_bytes.saturating_add(size_bytes);
-                    if total_bytes > WORK_EXEC_MAX_TOTAL_BYTES {
-                        return Err(BridgeError::new(
-                            ErrorCode::ResourceBudgetExceeded,
-                            format!(
-                                "Work-copy snapshot exceeds {WORK_EXEC_MAX_TOTAL_BYTES} bytes total limit."
-                            ),
-                            OriginLayer::JobRunner,
-                        ));
-                    }
-                    if files.len() + 1 > WORK_EXEC_MAX_SNAPSHOT_FILES {
-                        return Err(BridgeError::new(
-                            ErrorCode::ResourceBudgetExceeded,
-                            format!(
-                                "Work-copy snapshot exceeds {WORK_EXEC_MAX_SNAPSHOT_FILES} files limit."
-                            ),
-                            OriginLayer::JobRunner,
-                        ));
-                    }
-                    files.push(canonical_sub);
+                    candidates.push((canonical_sub, size_bytes));
                 }
             }
         }
@@ -2881,13 +2901,14 @@ pub fn discover_work_python_scope(
         }
     }
 
-    files.sort();
-    let has_init = files.iter().any(|f| f == "tests/__init__.py");
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_bytes = check_python_snapshot_limits(&candidates)?;
+    let files: Vec<String> = candidates.into_iter().map(|(path, _)| path).collect();
     let has_test_mod = files.iter().any(|f| is_work_test_module_path(f));
-    if files.len() < 2 || !has_init || !has_test_mod {
+    if !has_test_mod {
         return Err(BridgeError::new(
             ErrorCode::InvalidArgument,
-            "INVALID_TEST_SCOPE: work copy must include tests/__init__.py and at least one tests/test_*.py.",
+            "INVALID_TEST_SCOPE: work copy must include at least one tests/test_*.py.",
             OriginLayer::Validation,
         ));
     }
@@ -3684,13 +3705,17 @@ mod tests {
             );
         }
 
-        // Limit 1: Per-file size > 256 KiB refused.
+        // Limit 1: Per-file size > 256 KiB refused with path, measured size, and limit (no content).
         let big_file = ws.join("too_big.py");
-        fs::write(&big_file, vec![b'a'; (WORK_EXEC_MAX_FILE_BYTES as usize) + 1]).unwrap();
-        assert_eq!(
-            discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err().code,
-            ErrorCode::ResourceBudgetExceeded
-        );
+        let mut big_content = b"SECRET_BODY_DO_NOT_LEAK\n".to_vec();
+        big_content.resize((WORK_EXEC_MAX_FILE_BYTES as usize) + 1, b'a');
+        fs::write(&big_file, &big_content).unwrap();
+        let err1 = discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err();
+        assert_eq!(err1.code, ErrorCode::ResourceBudgetExceeded);
+        assert!(err1.message.contains("too_big.py"), "{}", err1.message);
+        assert!(err1.message.contains(&(WORK_EXEC_MAX_FILE_BYTES + 1).to_string()), "{}", err1.message);
+        assert!(err1.message.contains(&WORK_EXEC_MAX_FILE_BYTES.to_string()), "{}", err1.message);
+        assert!(!err1.message.contains("SECRET_BODY_DO_NOT_LEAK"), "{}", err1.message);
         fs::remove_file(&big_file).unwrap();
 
         // Limit 2: Total snapshot bytes > 4 MiB refused (17 files * 250 KiB = 4.25 MiB, <= 128 files).
@@ -3700,10 +3725,10 @@ mod tests {
         for i in 0..17 {
             fs::write(bulk_dir.join(format!("m_{i:02}.py")), &chunk_250k).unwrap();
         }
-        assert_eq!(
-            discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err().code,
-            ErrorCode::ResourceBudgetExceeded
-        );
+        let err2 = discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err();
+        assert_eq!(err2.code, ErrorCode::ResourceBudgetExceeded);
+        assert!(err2.message.contains("total size"), "{}", err2.message);
+        assert!(err2.message.contains(&WORK_EXEC_MAX_TOTAL_BYTES.to_string()), "{}", err2.message);
         fs::remove_dir_all(&bulk_dir).unwrap();
 
         // Limit 3: Snapshot file count > 128 refused (3 existing + 126 new = 129).
@@ -3712,10 +3737,9 @@ mod tests {
         for i in 0..126 {
             fs::write(many_py.join(format!("f_{i:03}.py")), "X = 1\n").unwrap();
         }
-        assert_eq!(
-            discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err().code,
-            ErrorCode::ResourceBudgetExceeded
-        );
+        let err3 = discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err();
+        assert_eq!(err3.code, ErrorCode::ResourceBudgetExceeded);
+        assert!(err3.message.contains("file count 129 exceeds 128"), "{}", err3.message);
         fs::remove_dir_all(&many_py).unwrap();
 
         // Limit 4: Discovery entry count > 1,000 refused (non-.py files still count as entries).
@@ -3724,10 +3748,82 @@ mod tests {
         for i in 0..1_001 {
             fs::write(many_entries.join(format!("e_{i:04}.txt")), "x").unwrap();
         }
-        assert_eq!(
-            discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err().code,
-            ErrorCode::ResourceBudgetExceeded
-        );
+        let err4 = discover_work_python_scope(&root, &rid, &state, pid, "fix-1", None).unwrap_err();
+        assert_eq!(err4.code, ErrorCode::ResourceBudgetExceeded);
+        assert!(err4.message.contains("entry count 1001 exceeds 1000"), "{}", err4.message);
         fs::remove_dir_all(&many_entries).unwrap();
+    }
+
+    #[test]
+    fn discover_work_python_scope_allows_missing_tests_init_and_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let state = dir.path().join("state");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(root.join("calc.py"), "def add(a, b): return a + b\n").unwrap();
+        fs::write(root.join("tests/test_calc.py"), "import unittest\n").unwrap();
+
+        let sf = ScopedFiles::new(&root, None).unwrap();
+        let rid = sf.current_root_identity().unwrap();
+        let pid = "proj_no_init";
+
+        // Workspace without tests/__init__.py (2 files: calc.py + tests/test_calc.py).
+        let copy_req = WorkCopyRequest {
+            workspace: "no-init".into(),
+            mode: WorkCopyMode::FromProject {
+                paths: vec!["calc.py".into(), "tests".into()],
+                exclude_generated: true,
+            },
+            overwrite_existing: false,
+        };
+        work_copy(
+            &root, &rid, &state, pid, &copy_req, &make_scope(),
+            auth_target_for("no-init"), |_| Ok(()),
+        )
+        .unwrap();
+
+        let scope = discover_work_python_scope(&root, &rid, &state, pid, "no-init", None).unwrap();
+        assert_eq!(scope.files, vec!["calc.py", "tests/test_calc.py"]);
+        assert!(!root.join("tests/__init__.py").exists());
+        assert!(!root.join("_pro/work/no-init/tests/__init__.py").exists());
+        assert!(discover_work_python_scope(&root, &rid, &state, pid, "no-init", Some("tests/test_calc.py")).is_ok());
+        assert!(discover_work_python_scope(&root, &rid, &state, pid, "no-init", Some("tests.test_calc.T.test_a")).is_ok());
+
+        // Single-file workspace with only tests/test_calc.py (no tests/__init__.py, no sibling module).
+        let single_req = WorkCopyRequest {
+            workspace: "single-file".into(),
+            mode: WorkCopyMode::FromProject {
+                paths: vec!["tests/test_calc.py".into()],
+                exclude_generated: true,
+            },
+            overwrite_existing: false,
+        };
+        work_copy(
+            &root, &rid, &state, pid, &single_req, &make_scope(),
+            auth_target_for("single-file"), |_| Ok(()),
+        )
+        .unwrap();
+        let single_scope = discover_work_python_scope(&root, &rid, &state, pid, "single-file", None).unwrap();
+        assert_eq!(single_scope.files, vec!["tests/test_calc.py"]);
+
+        // Workspace without any tests/test_*.py is still refused.
+        let no_tests_req = WorkCopyRequest {
+            workspace: "no-tests".into(),
+            mode: WorkCopyMode::FromProject {
+                paths: vec!["calc.py".into()],
+                exclude_generated: true,
+            },
+            overwrite_existing: false,
+        };
+        work_copy(
+            &root, &rid, &state, pid, &no_tests_req, &make_scope(),
+            auth_target_for("no-tests"), |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_work_python_scope(&root, &rid, &state, pid, "no-tests", None).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
     }
 }

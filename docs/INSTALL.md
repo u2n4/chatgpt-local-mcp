@@ -4,52 +4,33 @@ Edge Project Bridge lets a remote AI model read one local project folder, create
 
 ## Quick install
 
-Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.6.0-pre1`), and run these three steps.
-
-### 1. Download `install.ps1` and `SHA256SUMS.txt`
-
-Public release:
+Open **PowerShell 7** (`pwsh`), replace `<VERSION>` with the release version (for example `0.6.0-pre2`), and run this block. It downloads `install.ps1` and `SHA256SUMS.txt`, checks the SHA-256 hash, stops if they differ, and runs the installer:
 
 ```powershell
+$ErrorActionPreference = 'Stop'
 $version = '<VERSION>'
 $base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
-```
-
-Private repository (requires [GitHub CLI](https://cli.github.com/) signed in with `gh auth login`):
-
-```powershell
-$version = '<VERSION>'
-gh release download "v$version" --repo u2n4/chatgpt-local-mcp --pattern 'install.ps1' --pattern 'SHA256SUMS.txt'
-```
-
-### 2. Verify `install.ps1` before running it
-
-```powershell
-(Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
-Select-String -Path '.\SHA256SUMS.txt' -Pattern 'install\.ps1$'
-```
-
-Confirm both 64-character hex hashes match exactly.
-
-> **Verification limit:** `SHA256SUMS.txt` from the same GitHub Release only detects a corrupted or swapped download; it does **not** protect against a compromised release or GitHub account. To trust `install.ps1` itself, compare its hash with a value from another channel or read the script before running it. The `-Sha256` option checks the release `.zip` only—it cannot check the script that is already running.
-
-### 3. Run the installer
-
-If you downloaded `install.ps1` in a web browser, unblock it first:
-
-```powershell
-Unblock-File -LiteralPath '.\install.ps1'
-```
-
-Start the interactive installer (it asks for the install folder and project folder, shows the resolved paths, and asks `y/N` before writing anything):
-
-```powershell
+$lines = @(Get-Content -LiteralPath '.\SHA256SUMS.txt' | Where-Object { $_ -match '^[0-9a-fA-F]{64}\s+\*?install\.ps1$' })
+if ($lines.Count -ne 1) { throw 'Expected one install.ps1 entry in SHA256SUMS.txt' }
+$expected = ($lines[0] -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch for install.ps1: expected $expected, got $actual" }
 pwsh -ExecutionPolicy Bypass -File .\install.ps1 -Version $version
 ```
 
-`-ExecutionPolicy Bypass` applies only to this single run; it does not change your system PowerShell policy. (If your policy already allows local scripts, `pwsh -File .\install.ps1 -Version $version` also works.)
+Private repository (requires [GitHub CLI](https://cli.github.com/) signed in with `gh auth login`): replace the two `Invoke-WebRequest` lines above with:
+
+```powershell
+gh release download "v$version" --repo u2n4/chatgpt-local-mcp --pattern 'install.ps1' --pattern 'SHA256SUMS.txt'
+```
+
+If you downloaded `install.ps1` in a web browser, unblock it first with `Unblock-File -LiteralPath '.\install.ps1'`.
+
+> **Verification limit:** `SHA256SUMS.txt` from the same GitHub Release only detects a corrupted or swapped download; it does **not** protect against a compromised release or GitHub account. To trust `install.ps1` itself, compare its hash with a value from another channel or read the script before running it. The `-Sha256` option checks the release `.zip` only—it cannot check the script that is already running.
+
+`-ExecutionPolicy Bypass` applies only to this single run; it does not change your system PowerShell policy. (If your policy already allows local scripts, `pwsh -File .\install.ps1 -Version $version` also works.) The interactive installer asks for the install folder and project folder, shows the resolved paths, and asks `y/N` before writing anything.
 
 ---
 
@@ -104,59 +85,67 @@ If `SHA256SUMS.txt` is in the same folder as `-ZipPath`, you may omit `-Sha256` 
 
 Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjectBridge`). If your PowerShell policy blocks local scripts, run each script with `pwsh -ExecutionPolicy Bypass -File .\<script>.ps1`.
 
-1. **Check Windows environment variables:**
+1. **Daily start (one command):**
 
    ```powershell
-   .\environment-check.ps1
+   .\start.ps1
    ```
 
-   Sandboxed runs can read persistent user and machine environment variables stored in the Windows registry. While any entry looks like a credential, the worker refuses test runs with `PERSISTENT_ENVIRONMENT_HOLDS_CREDENTIALS`. Remove those entries from the persistent Windows environment, or start `edge-bridge.exe` manually with `--allow-environment-credentials` only if you explicitly accept that test runs can read them.
+   `start.ps1` runs the environment check (stopping with the variable names if persistent Windows environment variables look like credentials), creates a `pro-agent` grant valid for 240 minutes (4 hours), prints `grant_id`, `expires_at`, and a one-line access summary, and starts the local worker in the same window (press `Ctrl+C` to stop it).
 
-2. **Create a temporary permission pass (valid for 60 minutes by default):**
+   - If the worker runtime is not built yet, `start.ps1` still creates the grant (reading, copying, editing, and diffing work without the worker) and tells you to run `.\setup-worker.ps1`.
+   - Start from a normal interactive Windows desktop session—not a background service or headless session.
+   - **`--allow-work-exec` is off by default.** To opt in, pass `.\start.ps1 -AllowWorkExec`, which prints a three-line warning (remote-authored code runs in the sandbox and can read your Windows user name, profile paths, `HKCU\Software`, `HKLM\Software`, and `HKCU\Environment`) and asks `y/N` before passing `--allow-work-exec`. `powershell_script_work` is refused everywhere.
+
+2. **Connect ChatGPT web (optional, requires OpenAI `tunnel-client`):**
 
    ```powershell
-   # Review-only (default: pro-review)
-   .\new-grant.ps1
+   # One-time profile setup (prompts for tunnel id and hidden runtime API key, then runs tunnel-client doctor)
+   .\setup-tunnel.ps1
 
-   # Workspace editing under _pro\work\<workspace>\ (pro-agent)
-   .\new-grant.ps1 -Profile pro-agent
+   # Start the tunnel in a second PowerShell 7 window and leave it open
+   .\start-tunnel.ps1
    ```
 
-   This prints `profile`, `grant_id`, `expires_at`, and `project_id`.
+   While `.\start-tunnel.ps1` is running, open <https://chatgpt.com/#settings/Connectors>, add the tunnel as a connector, and refresh it—the connector must show 46 tools. If `tunnel-client` is not on `PATH`, pass `-TunnelClientPath <path-to-tunnel-client.exe>`.
 
-3. **Start the local test worker** (from a normal interactive Windows desktop session—not a background service or headless session):
-
-   If the installer listed missing test-run tools, install them, open a new PowerShell 7 window, and run `.\setup-worker.ps1` first. Then run:
-
-   ```powershell
-   .\start-worker.ps1
-   ```
-
-   Leave this window open while you want queued test runs executed (press `Ctrl+C` to stop it). Pass `--once` (`.\start-worker.ps1 --once`) to drain the current queue and exit (it exits quietly with no output when the queue is empty).
-
-   **`--allow-work-exec` is off by default** (and `start-worker.ps1` does not pass it). Without it, `python_tests_work` is refused with `WORK_EXEC_NOT_ENABLED`, while a `pro-agent` model can still copy, edit, diff, and export patches in `_pro\work\` and run the project's own `python_tests`. Only pass `.\start-worker.ps1 --allow-work-exec` if you explicitly accept the sandbox registry risk documented in `docs/KNOWN_LIMITATIONS.md` (measured on one PC: no network and no folder outside the snapshot, but Windows user name, profile paths, `HKCU\Software`, `HKLM\Software`, and `HKCU\Environment` are reachable by remote-authored code). `powershell_script_work` is refused everywhere.
-
-4. **Apply a `pro-agent` workspace locally (owner CLI):**
-
-   ```powershell
-   # Dry run (shows planned changes and diff without modifying project files)
-   .\bin\edge-bridge.exe --state-dir=.\state work-apply <project_id> <workspace>
-
-   # Apply atomically (all files or none) and save a rollback journal
-   .\bin\edge-bridge.exe --state-dir=.\state work-apply <project_id> <workspace> --confirm
-
-   # Roll back if needed (refuses to overwrite later edits)
-   .\bin\edge-bridge.exe --state-dir=.\state rollback-patch --project-root <project> --journal-id <journal_id>
-   ```
-
-5. **Connect an MCP client:**
-
-   For a local MCP client that launches a command over standard input/output (stdio), configure the exact **Program** and **Arguments** printed by the installer:
+   For a local MCP client (such as Claude Code or Codex CLI) that launches a command over stdio, configure the exact **Program** and **Arguments** printed by the installer:
 
    - Program: `<InstallDir>\bin\edge-bridge.exe`
    - Arguments: `--state-dir=<InstallDir>\state`, `mcp`, `--principal=executor:default`
 
-   ChatGPT web cannot start a local program. It needs a tunnel and connector that you set up yourself; this installer does not set them up.
+3. **Apply or roll back a `pro-agent` workspace locally:**
+
+   ```powershell
+   # Preview changes (dry run), ask y/N, apply atomically, and print the rollback command
+   .\apply.ps1 <workspace>
+
+   # Undo an applied patch (refuses to overwrite later edits)
+   .\rollback.ps1 <journal_id>
+   ```
+
+4. **Check status at any time:**
+
+   ```powershell
+   .\status.ps1
+   ```
+
+## Helper scripts reference
+
+The installer writes these PowerShell 7 helper scripts into `<InstallDir>`. Every helper reads `<InstallDir>\install.json` and passes arguments safely without placing user-typed paths inside command strings.
+
+| Helper | Parameters | What it does |
+| --- | --- | --- |
+| `start.ps1` | `-Profile` / `-GrantProfile` (`pro-agent` default, or `pro-review`), `-Minutes` (`1..1440`, default `240`), `-AllowWorkExec`, forwarded worker args (for example `--once`) | Daily one-command start: runs `environment-check` (stops if credential-like entries exist), optionally confirms `-AllowWorkExec` after a 3-line warning and `y/N`, creates a grant, prints `grant_id`, `expires_at`, and a one-line access summary, and starts the worker (or prints `setup-worker.ps1` guidance while keeping the grant if the runtime is not built). |
+| `status.ps1` | *(none)* | Prints the `edge-bridge` binary version, release version, project path and `project_id`, worker runtime status (`built` or `not built`), missing test-run prerequisites, workspaces under `_pro\work\` with file counts, and files under `_pro\outbox\` and `_pro\reports\`. |
+| `apply.ps1` | `<workspace>` (positional, `^[a-z0-9][a-z0-9_-]{0,39}$`) | Runs `edge-bridge work-apply` dry run to show added/modified/deleted files and unified diff, refuses on drift/conflicts, asks `y/N`, applies with `--confirm`, and prints the `journal_id` and exact `.\rollback.ps1 <journal_id>` command. |
+| `rollback.ps1` | `<journal_id>` (positional, `^pjr_[0-9a-fA-F]{32}$`) | Runs `edge-bridge rollback-patch` against the installed project root and prints the restored files. |
+| `setup-tunnel.ps1` | `-TunnelClientPath`, `-TunnelProfile` / `-Profile` (default `chatgpt-local-mcp`), `-ProfileDir`, `-Force` | Finds `tunnel-client` on `PATH` or via `-TunnelClientPath` (if missing, explains what it is and prints the OpenAI setup URLs), prompts for the tunnel id (`tunnel_` + 32 lowercase hex chars) and runtime API key with `Read-Host -AsSecureString`, stores the key in `<InstallDir>\state\tunnel-runtime.key` (restricted to your Windows user account, never on the command line or logged), creates the `sample_mcp_stdio_local` profile via `tunnel-client init`, saves non-secret settings to `tunnel.json`, runs `tunnel-client doctor --explain`, and prints the final two steps (`.\start-tunnel.ps1` and <https://chatgpt.com/#settings/Connectors>). |
+| `start-tunnel.ps1` | `-TunnelProfile` / `-Profile`, `-TunnelClientPath`, `-ProfileDir` | Starts the configured tunnel profile with `tunnel-client run --profile <name>` using `tunnel.json` (or overrides). |
+| `environment-check.ps1` | *(none)* | Runs `edge-bridge environment-check` to list persistent user/machine environment variable names that look like credentials. |
+| `new-grant.ps1` | `-Profile` / `-GrantProfile` (`pro-review` default, or `pro-agent`), `-Minutes` (`1..1440`, default `60`) | Creates a standalone grant and prints `profile`, `grant_id`, `expires_at`, and `project_id`. |
+| `setup-worker.ps1` | *(none)* | Builds `<InstallDir>\runtime\.venv` with `uv --no-config sync --locked --no-python-downloads` using Python 3.13 after you install missing tools. |
+| `start-worker.ps1` | Forwarded worker args (for example `--once`, `--allow-work-exec`, `--allow-environment-credentials`) | Starts `edge-bridge worker` directly without creating a new grant. Does not pass `--allow-work-exec` by default. |
 
 ## Prerequisites details
 
@@ -190,7 +179,7 @@ Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjec
 - `<InstallDir>\runtime\` — Python worker files and (when `uv` and Python 3.13 are present) `<InstallDir>\runtime\.venv\`, built with `uv --no-config sync --locked --no-python-downloads` after clearing shell `UV_*`/`VIRTUAL_ENV` overrides (`uv` still uses its own cache outside `<InstallDir>`).
 - `<InstallDir>\state\state.sqlite3` (and SQLite journal files) — state database with your project registered.
 - `<InstallDir>\install.json` — saved install paths and `project_id`. Helper scripts run the binary recorded here, so keep `<InstallDir>` writable only by you.
-- `<InstallDir>\environment-check.ps1`, `new-grant.ps1`, `setup-worker.ps1`, `start-worker.ps1` — helper scripts (`new-grant.ps1` accepts `-Profile pro-review` [default] or `-Profile pro-agent`; `start-worker.ps1` does not pass `--allow-work-exec` by default; `setup-worker.ps1` builds `<InstallDir>\runtime\.venv` with `uv` and Python 3.13 without checking pinned PowerShell/Codex hashes).
+- `<InstallDir>\start.ps1`, `status.ps1`, `apply.ps1`, `rollback.ps1`, `setup-tunnel.ps1`, `start-tunnel.ps1`, `environment-check.ps1`, `new-grant.ps1`, `setup-worker.ps1`, `start-worker.ps1` — helper scripts (see [Helper scripts reference](#helper-scripts-reference)). Running `setup-tunnel.ps1` later also writes `<InstallDir>\tunnel.json` and `<InstallDir>\state\tunnel-runtime.key`.
 - Documentation and license files from the release zip (`LICENSE`, `README.md`, `SECURITY_BOUNDARIES.md`, `docs\`).
 - `<ProjectPath>\_pro\`, `_pro\inbox\`, `_pro\outbox\`, `_pro\reports\` — created only if missing; existing project files are never modified.
 - Temporary folders deleted on exit (`%TEMP%\epb-install-<id>\` and staging folders inside `<InstallDir>`).
@@ -199,9 +188,9 @@ Open PowerShell 7 in your install folder (default: `$env:LOCALAPPDATA\EdgeProjec
 
 - No administrator rights required.
 - Does not change `PATH`, the Windows registry, environment variables, or PowerShell execution policy.
-- Does not install missing prerequisites.
+- Does not install missing prerequisites or `tunnel-client`.
 - Does not modify, move, or delete existing project files.
-- Does not set up a tunnel or ChatGPT web connector.
+- Does not start a tunnel or configure a ChatGPT web connector during install (run `.\setup-tunnel.ps1` when ready).
 - Rolls back directories and files it created if any step fails.
 
 ## Newer version
@@ -210,7 +199,7 @@ The installer does not upgrade in place. Install the newer version into a new fo
 
 ## Uninstall
 
-1. Stop any running worker (`start-worker.ps1`) and disconnect any MCP client using `edge-bridge.exe`.
+1. Stop any running worker (`start.ps1` / `start-worker.ps1`), stop any running tunnel (`start-tunnel.ps1`), and disconnect any MCP client using `edge-bridge.exe`.
 2. Delete `<InstallDir>`:
 
    ```powershell

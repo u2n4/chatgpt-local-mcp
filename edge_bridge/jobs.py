@@ -29,8 +29,14 @@ _ACTIVE = {"queued", "running", "cancelling"}
 _JOB_ID = re.compile(r"job_[a-f0-9]{32}\Z")
 _PS_PATH = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*/){0,5}[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:ps1|psd1|psm1|json)\Z")
 _TEST_TARGET = re.compile(r"tests\.test_[A-Za-z0-9_]+(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}\Z")
+PYTHON_SNAPSHOT_MAX_FILES = 128
+PYTHON_SNAPSHOT_MAX_FILE_BYTES = 256 * 1024
+PYTHON_SNAPSHOT_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+POWERSHELL_SNAPSHOT_MAX_FILES = 32
+POWERSHELL_SNAPSHOT_MAX_FILE_BYTES = 65_536
+POWERSHELL_SNAPSHOT_MAX_TOTAL_BYTES = 524_288
 _REVIEW_LIMIT = 65_536
-_MAX_WORK_FILE_BYTES = 256 * 1024
+_MAX_WORK_FILE_BYTES = PYTHON_SNAPSHOT_MAX_FILE_BYTES
 _DIFF_BUDGET = 24_000
 
 
@@ -100,16 +106,27 @@ def validate_project_test_files(
     runtime: str,
     files: list[str],
     *,
-    max_files: int = 32,
-    max_total_bytes: int = 524_288,
-    max_file_bytes: int = 65_536,
+    max_files: int | None = None,
+    max_total_bytes: int | None = None,
+    max_file_bytes: int | None = None,
     source_allowlist: frozenset[str] | None = None,
 ) -> list[str]:
     """Validate the owner-approved selection without copying or starting code."""
+    if max_files is None:
+        max_files = PYTHON_SNAPSHOT_MAX_FILES if runtime == "python" else POWERSHELL_SNAPSHOT_MAX_FILES
+    if max_total_bytes is None:
+        max_total_bytes = PYTHON_SNAPSHOT_MAX_TOTAL_BYTES if runtime == "python" else POWERSHELL_SNAPSHOT_MAX_TOTAL_BYTES
+    if max_file_bytes is None:
+        max_file_bytes = PYTHON_SNAPSHOT_MAX_FILE_BYTES if runtime == "python" else POWERSHELL_SNAPSHOT_MAX_FILE_BYTES
     if isinstance(max_file_bytes, bool) or not isinstance(max_file_bytes, int) or not 1 <= max_file_bytes <= _MAX_WORK_FILE_BYTES:
         raise JobError("INVALID_TEST_SCOPE", "Invalid per-file size limit for test snapshot.")
-    min_files = 1 if runtime == "powershell" else 2
+    min_files = 1 if runtime in ("powershell", "python") else 2
     if not isinstance(files, list) or not min_files <= len(files) <= max_files:
+        if isinstance(files, list) and len(files) > max_files:
+            raise JobError(
+                "INVALID_TEST_SCOPE",
+                f"snapshot file count {len(files)} exceeds {max_files} (choose between {min_files} and {max_files} supported files).",
+            )
         raise JobError("INVALID_TEST_SCOPE", f"Choose between {min_files} and {max_files} supported files.")
     if runtime == "powershell":
         if any(not isinstance(path, str) or len(path) > 180 or not _PS_PATH.fullmatch(path) or ".." in path for path in files):
@@ -123,9 +140,8 @@ def validate_project_test_files(
             raise JobError("INVALID_TEST_SCOPE", "Use canonical relative files for the selected test runtime.")
     if len({path.casefold() for path in files}) != len(files):
         raise JobError("INVALID_TEST_SCOPE", "Duplicate file paths are not allowed.")
-    if runtime == "python" and ("tests/__init__.py" not in files
-                                or not any(re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", path) for path in files)):
-        raise JobError("INVALID_TEST_SCOPE", "Include tests/__init__.py and at least one tests/test_*.py.")
+    if runtime == "python" and not any(re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", path) for path in files):
+        raise JobError("INVALID_TEST_SCOPE", "Include at least one tests/test_*.py.")
     if runtime == "node" and not any(re.fullmatch(r"tests/[A-Za-z_][A-Za-z0-9_]*\.test\.mjs", path) for path in files):
         raise JobError("INVALID_TEST_SCOPE", "Include at least one tests/*.test.mjs file.")
     source = ProjectFiles(project["root"], project["root_identity"])
@@ -139,8 +155,8 @@ def _read_project_test_files(
     source: ProjectFiles,
     files: list[str],
     *,
-    max_total_bytes: int = 524_288,
-    max_file_bytes: int = 65_536,
+    max_total_bytes: int = PYTHON_SNAPSHOT_MAX_TOTAL_BYTES,
+    max_file_bytes: int = PYTHON_SNAPSHOT_MAX_FILE_BYTES,
     source_allowlist: frozenset[str] | None = None,
 ) -> list[dict]:
     items = []
@@ -148,18 +164,32 @@ def _read_project_test_files(
     for path in files:
         if source_allowlist is not None and path not in source_allowlist:
             raise JobError("BRIDGE_POLICY_DENIED", "The source path is outside the broker-approved snapshot list.")
-        if max_file_bytes <= 65_536:
-            item = source.read(path, limit=max_file_bytes)
-        else:
-            try:
+        try:
+            if max_file_bytes <= 65_536:
+                item = source.read(path, limit=max_file_bytes)
+            else:
                 item = source.read_snapshot_file(path, max_bytes=max_file_bytes)
-            except FileBoundaryError as exc:
-                if exc.code == "RESOURCE_BUDGET_EXCEEDED":
-                    raise JobError("RESOURCE_BUDGET_EXCEEDED", "A project snapshot cannot exceed its file or total size limit.") from exc
-                raise
+        except FileBoundaryError as exc:
+            if exc.code == "RESOURCE_BUDGET_EXCEEDED":
+                size = exc.details.get("size")
+                if isinstance(size, int):
+                    raise JobError(
+                        "RESOURCE_BUDGET_EXCEEDED",
+                        f"snapshot file '{path}' size {size} bytes exceeds {max_file_bytes} bytes.",
+                    ) from exc
+                raise JobError("RESOURCE_BUDGET_EXCEEDED", str(exc)) from exc
+            raise
+        if item["truncated"] or item["size"] > max_file_bytes:
+            raise JobError(
+                "RESOURCE_BUDGET_EXCEEDED",
+                f"snapshot file '{path}' size {item['size']} bytes exceeds {max_file_bytes} bytes.",
+            )
         total += item["size"]
-        if item["truncated"] or item["size"] > max_file_bytes or total > max_total_bytes:
-            raise JobError("RESOURCE_BUDGET_EXCEEDED", "A project snapshot cannot exceed its file or total size limit.")
+        if total > max_total_bytes:
+            raise JobError(
+                "RESOURCE_BUDGET_EXCEEDED",
+                f"snapshot total size {total} bytes exceeds {max_total_bytes} bytes.",
+            )
         items.append(item)
     return items
 
@@ -258,7 +288,10 @@ class Jobs:
                     if target_file not in scope["files"]:
                         raise JobError("INVALID_TEST_SCOPE", "The requested test target is outside the approved file list.")
                 if len(scope["files"]) > exec_policy["max_files"]:
-                    raise JobError("RESOURCE_BUDGET_EXCEEDED", "Approved scope exceeds current max_files policy.")
+                    raise JobError(
+                        "RESOURCE_BUDGET_EXCEEDED",
+                        f"snapshot file count {len(scope['files'])} exceeds {exec_policy['max_files']}.",
+                    )
             job = self.store.create_job(project["project_id"], principal, task_id, operation_id, {
                 "executable": executable, "argv": argv, "cwd_relative": cwd_relative,
                 "timeout_seconds": timeout_seconds,
@@ -433,7 +466,7 @@ class Jobs:
         except Exception as error:
             failure = getattr(error, "code", "SUPERVISOR_FAILURE")
             evidence["failure_code"] = failure
-            if failure == "ISOLATION_NOT_VERIFIED":
+            if failure in {"ISOLATION_NOT_VERIFIED", "RESOURCE_BUDGET_EXCEEDED", "INVALID_TEST_SCOPE"}:
                 evidence["diagnostic_hint"] = str(error)
             if failure in {"PROCESS_OWNERSHIP_UNCONFIRMED", "JOB_EXIT_UNCONFIRMED"}:
                 uncertain = True

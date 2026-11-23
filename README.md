@@ -27,25 +27,19 @@ ChatGPT Local MCP connects ChatGPT web, or any MCP client, to one project folder
 
 ### Install
 
-Open **PowerShell 7** and run:
+Open **PowerShell 7** and run this block. It downloads `install.ps1` and `SHA256SUMS.txt`, compares the SHA-256 hash, stops if they differ, and then runs the installer:
 
 ```powershell
-$version = '0.6.0-pre1'
+$ErrorActionPreference = 'Stop'
+$version = '0.6.0-pre2'
 $base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
-```
-
-Check that the two hashes are the same:
-
-```powershell
-(Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
-Select-String -Path '.\SHA256SUMS.txt' -Pattern 'install\.ps1$'
-```
-
-Run the installer:
-
-```powershell
+$lines = @(Get-Content -LiteralPath '.\SHA256SUMS.txt' | Where-Object { $_ -match '^[0-9a-fA-F]{64}\s+\*?install\.ps1$' })
+if ($lines.Count -ne 1) { throw 'Expected one install.ps1 entry in SHA256SUMS.txt' }
+$expected = ($lines[0] -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch for install.ps1: expected $expected, got $actual" }
 pwsh -ExecutionPolicy Bypass -File .\install.ps1 -Version $version
 ```
 
@@ -53,14 +47,15 @@ The installer asks two questions: where to install, and which project folder to 
 
 ### First use
 
-Open PowerShell 7 in the install folder and run the helper scripts in this order:
+Open PowerShell 7 in the install folder and run:
 
-| Step | Command | What it does |
-| --- | --- | --- |
-| 1 | `.\environment-check.ps1` | Lists entries in your persistent environment that look like credentials. A test run is refused while any exist. |
-| 2 | `.\new-grant.ps1 -Profile pro-agent` | Creates a grant, valid for 60 minutes, and prints its `grant_id`. Without `-Profile` the grant is `pro-review`: read, and create reports only. |
-| 3 | `.\setup-worker.ps1` | Only when the installer listed missing items for test runs: run it after you install them. |
-| 4 | `.\start-worker.ps1` | Starts the local worker that runs the queued tests. Leave the window open. |
+```powershell
+.\start.ps1
+```
+
+`start.ps1` runs the environment check (stopping if persistent environment variables look like credentials), creates a 4-hour `pro-agent` grant (override with `-Profile pro-review` or `-Minutes <1..1440>`), prints the grant id and expiry, and starts the local worker in the same window. If the worker runtime is not built yet, it still creates the grant (reading, copying, editing and diffing work without the worker) and tells you to run `.\setup-worker.ps1` after installing missing test-run prerequisites.
+
+Run `.\status.ps1` at any time to see the binary version, project path and id, worker status, missing prerequisites, and `_pro\` workspaces and outputs. Individual helpers (`environment-check.ps1`, `new-grant.ps1`, `setup-worker.ps1`, `start-worker.ps1`) are also in the install folder; see [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Connect an MCP client that starts a local program
 
@@ -73,18 +68,23 @@ For a client such as Claude Code or Codex CLI, add a stdio MCP server with the v
 
 ### Connect ChatGPT web
 
-ChatGPT web cannot start a program on your PC. It reaches the bridge through OpenAI's `tunnel-client`. The installer does not set this up. These steps were tested with `tunnel-client` 0.0.21 on one PC:
+ChatGPT web cannot start a program on your PC. It reaches the bridge through OpenAI's `tunnel-client` (tested with `tunnel-client` 0.0.21 on one PC). After installing `tunnel-client`, run from the install folder:
 
-1. Create a tunnel at <https://platform.openai.com/settings/organization/tunnels> and copy its tunnel id.
-2. Create a runtime API key at <https://platform.openai.com/settings/organization/api-keys>.
-3. Create a tunnel profile that starts the bridge (one line):
+1. Create a tunnel at <https://platform.openai.com/settings/organization/tunnels> and a runtime API key at <https://platform.openai.com/settings/organization/api-keys>.
+2. Configure and check the tunnel profile (prompts for the tunnel id and hidden runtime API key, stores the key in `<InstallDir>\state\tunnel-runtime.key` without putting it on the command line, and runs `tunnel-client doctor`):
 
    ```powershell
-   tunnel-client init --sample sample_mcp_stdio_local --profile chatgpt-local-mcp --tunnel-id <tunnel id> --mcp-command "'<InstallDir>/bin/edge-bridge.exe' --state-dir '<InstallDir>/state' mcp --principal executor:default"
+   .\setup-tunnel.ps1
    ```
 
-4. Check the profile with `tunnel-client doctor`, then start it with `tunnel-client run`. `tunnel-client help quickstart` gives the exact options for your version.
-5. In ChatGPT, open <https://chatgpt.com/#settings/Connectors>, add the tunnel as a connector, and refresh it. It must show 46 tools.
+   If `tunnel-client` is not on `PATH`, pass `-TunnelClientPath <path-to-tunnel-client.exe>`.
+3. Start the tunnel in a second PowerShell 7 window and leave it open:
+
+   ```powershell
+   .\start-tunnel.ps1
+   ```
+
+4. While the tunnel is running, open <https://chatgpt.com/#settings/Connectors>, add the tunnel as a connector, and refresh it. The connector must show 46 tools.
 
 ### Give the model a job
 
@@ -97,25 +97,23 @@ run the tests, repeat until they pass, then work_export_diff to _pro/outbox/fix1
 and write a short report to _pro/reports/fix1.md.
 ```
 
-When it finishes, look at the change and apply it. The project id is in `<InstallDir>\install.json`:
+When it finishes, preview and apply the change from the install folder:
 
 ```powershell
-cd <InstallDir>
-.\bin\edge-bridge.exe --state-dir .\state work-apply <project_id> fix1            # shows what would change
-.\bin\edge-bridge.exe --state-dir .\state work-apply <project_id> fix1 --confirm  # applies it
+.\apply.ps1 fix1
 ```
 
-`work-apply` changes all files or none. It refuses when a project file changed after the model copied it, and it prints a journal id that `rollback-patch` restores:
+`apply.ps1` runs a dry-run preview of what would change, asks `y/N`, and applies all files or none. It refuses when a project file changed after the model copied it, and prints the `journal_id` and exact rollback command:
 
 ```powershell
-.\bin\edge-bridge.exe --state-dir .\state rollback-patch --project-root <project folder> --journal-id <journal id>
+.\rollback.ps1 <journal_id>
 ```
 
 ### Limits you should know
 
 - A run lasts at most 60 seconds, and only standard-library `unittest` runs. A project that needs `pytest`, `numpy` or other packages cannot be tested yet.
-- The project's own tests run only when the project is small: at most 32 files, 64 KiB per file. Larger projects are refused with `RESOURCE_BUDGET_EXCEEDED`.
-- The model cannot test its own change by default. `start-worker.ps1 --allow-work-exec` turns that on. Code written by the model then runs in the sandbox on your PC. Measured on one PC: no network and no folder outside the copy, but the code can read your user name, profile paths and the registry keys `HKCU\Software`, `HKLM\Software` and `HKCU\Environment`. Turn it on only when you accept that.
+- A test run works on a snapshot of at most 128 files, 256 KiB per file and 4 MiB in total. A larger project is refused with `RESOURCE_BUDGET_EXCEEDED`, and the refusal names the limit and the measured value. The tests folder needs no `__init__.py`.
+- The model cannot test its own change by default. `.\start.ps1 -AllowWorkExec` (which prints a warning and asks `y/N` first) or `.\start-worker.ps1 --allow-work-exec` turns that on. Code written by the model then runs in the sandbox on your PC. Measured on one PC: no network and no folder outside the copy, but the code can read your user name, profile paths and the registry keys `HKCU\Software`, `HKLM\Software` and `HKCU\Environment`. Turn it on only when you accept that.
 - Test runs need the exact pinned builds of PowerShell `7.7.0` and `@openai/codex@0.171.0`. The Codex package is used only as the sandbox engine; it needs no OpenAI account and no model. If either build updates, test runs fail until the pins are updated.
 - This is a prerelease, tested on one PC. `SHA256SUMS.txt` from the same release detects a damaged download only; it does not prove who published the release.
 
@@ -156,25 +154,19 @@ ChatGPT Local MCP يربط ChatGPT web، أو أي MCP client، بمجلد مش�
 
 ### التثبيت
 
-افتح **PowerShell 7** وشغّل:
+افتح **PowerShell 7** وشغّل هذا المقطع. ينزّل `install.ps1` و `SHA256SUMS.txt`، يقارن تجزئة SHA-256، يتوقف إذا اختلفتا، ثم يشغّل المثبّت:
 
 ```powershell
-$version = '0.6.0-pre1'
+$ErrorActionPreference = 'Stop'
+$version = '0.6.0-pre2'
 $base = "https://github.com/u2n4/chatgpt-local-mcp/releases/download/v$version"
 Invoke-WebRequest -Uri "$base/install.ps1" -OutFile '.\install.ps1'
 Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile '.\SHA256SUMS.txt'
-```
-
-تأكد أن التجزئتين متطابقتان:
-
-```powershell
-(Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
-Select-String -Path '.\SHA256SUMS.txt' -Pattern 'install\.ps1$'
-```
-
-شغّل المثبّت:
-
-```powershell
+$lines = @(Get-Content -LiteralPath '.\SHA256SUMS.txt' | Where-Object { $_ -match '^[0-9a-fA-F]{64}\s+\*?install\.ps1$' })
+if ($lines.Count -ne 1) { throw 'Expected one install.ps1 entry in SHA256SUMS.txt' }
+$expected = ($lines[0] -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -LiteralPath '.\install.ps1' -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch for install.ps1: expected $expected, got $actual" }
 pwsh -ExecutionPolicy Bypass -File .\install.ps1 -Version $version
 ```
 
@@ -182,14 +174,15 @@ pwsh -ExecutionPolicy Bypass -File .\install.ps1 -Version $version
 
 ### أول استخدام
 
-افتح PowerShell 7 في مجلد التثبيت وشغّل السكربتات المساعدة بهذا الترتيب:
+افتح PowerShell 7 في مجلد التثبيت وشغّل:
 
-| الخطوة | الأمر | ماذا يفعل |
-| --- | --- | --- |
-| 1 | `.\environment-check.ps1` | يعرض متغيرات البيئة الدائمة التي تشبه الأسرار. تشغيل الاختبارات يُرفض ما دامت موجودة. |
-| 2 | `.\new-grant.ps1 -Profile pro-agent` | ينشئ منحة (grant) صالحة 60 دقيقة ويطبع `grant_id`. بدون `-Profile` تكون المنحة `pro-review`: قراءة وإنشاء تقارير فقط. |
-| 3 | `.\setup-worker.ps1` | فقط إذا ذكر المثبّت أشياء ناقصة لتشغيل الاختبارات: شغّله بعد تثبيتها. |
-| 4 | `.\start-worker.ps1` | يشغّل الـ worker المحلي الذي ينفّذ الاختبارات. اترك النافذة مفتوحة. |
+```powershell
+.\start.ps1
+```
+
+الأمر `start.ps1` يفحص متغيرات البيئة الدائمة (ويتوقف إذا وجد متغيرات تشبه الأسرار)، وينشئ منحة `pro-agent` صالحة 4 ساعات (تقدر تغيّرها بـ `-Profile pro-review` أو `-Minutes <1..1440>`)، ويطبع `grant_id` ووقت الانتهاء، ثم يشغّل الـ worker المحلي في النافذة نفسها. إذا لم تكن بيئة الـ worker مبنية بعد، يبقى ينشئ المنحة (القراءة والنسخ والتعديل والـ diff تشتغل بدون الـ worker) ويطلب منك تشغيل `.\setup-worker.ps1` بعد تثبيت المتطلبات الناقصة.
+
+شغّل `.\status.ps1` في أي وقت لمعرفة إصدار البرنامج، مسار المشروع ورمزه، حالة الـ worker، المتطلبات الناقصة، ومناطق العمل والملفات داخل `_pro\`. السكربتات الفردية (`environment-check.ps1` و `new-grant.ps1` و `setup-worker.ps1` و `start-worker.ps1`) لا تزال موجودة في مجلد التثبيت؛ راجع [docs/INSTALL.md](docs/INSTALL.md).
 
 ### الربط مع MCP client يشغّل برنامجًا محليًا
 
@@ -202,18 +195,23 @@ pwsh -ExecutionPolicy Bypass -File .\install.ps1 -Version $version
 
 ### الربط مع ChatGPT web
 
-ChatGPT web لا يقدر يشغّل برنامجًا على جهازك. يصل إلى الـ bridge عن طريق `tunnel-client` من OpenAI. المثبّت لا يجهّز هذا. هذه الخطوات جُرّبت مع `tunnel-client` 0.0.21 على جهاز واحد:
+ChatGPT web لا يقدر يشغّل برنامجًا على جهازك. يصل إلى الـ bridge عن طريق `tunnel-client` من OpenAI (جُرّب مع `tunnel-client` 0.0.21 على جهاز واحد). بعد تثبيت `tunnel-client`، نفّذ من مجلد التثبيت:
 
-1. أنشئ tunnel من <https://platform.openai.com/settings/organization/tunnels> وانسخ الـ tunnel id.
-2. أنشئ runtime API key من <https://platform.openai.com/settings/organization/api-keys>.
-3. أنشئ profile للـ tunnel يشغّل الـ bridge (سطر واحد):
+1. أنشئ tunnel من <https://platform.openai.com/settings/organization/tunnels> و runtime API key من <https://platform.openai.com/settings/organization/api-keys>.
+2. جهّز الـ profile وافحصه (يسألك عن الـ tunnel id و الـ runtime API key بإدخال مخفي، يحفظ المفتاح في `<InstallDir>\state\tunnel-runtime.key` بدون وضعه على سطر الأوامر، ويشغّل `tunnel-client doctor`):
 
    ```powershell
-   tunnel-client init --sample sample_mcp_stdio_local --profile chatgpt-local-mcp --tunnel-id <tunnel id> --mcp-command "'<InstallDir>/bin/edge-bridge.exe' --state-dir '<InstallDir>/state' mcp --principal executor:default"
+   .\setup-tunnel.ps1
    ```
 
-4. افحص الـ profile بالأمر `tunnel-client doctor` ثم شغّله بالأمر `tunnel-client run`. الأمر `tunnel-client help quickstart` يعطيك الخيارات الدقيقة لنسختك.
-5. في ChatGPT افتح <https://chatgpt.com/#settings/Connectors>، أضف الـ tunnel كـ connector، ثم حدّثه (Refresh). يجب أن يعرض 46 أداة.
+   إذا لم يكن `tunnel-client` في `PATH`، مرّر `-TunnelClientPath <مسار-tunnel-client.exe>`.
+3. شغّل الـ tunnel في نافذة PowerShell 7 ثانية واتركها مفتوحة:
+
+   ```powershell
+   .\start-tunnel.ps1
+   ```
+
+4. بينما الـ tunnel يعمل، افتح <https://chatgpt.com/#settings/Connectors>، أضف الـ tunnel كـ connector، ثم حدّثه (Refresh). يجب أن يعرض 46 أداة.
 
 ### أعطِ الـ model مهمة
 
@@ -226,25 +224,23 @@ run the tests, repeat until they pass, then work_export_diff to _pro/outbox/fix1
 and write a short report to _pro/reports/fix1.md.
 ```
 
-بعد أن ينتهي، راجع التغيير وطبّقه. الـ project id موجود في `<InstallDir>\install.json`:
+بعد أن ينتهي، راجع التغيير وطبّقه من مجلد التثبيت:
 
 ```powershell
-cd <InstallDir>
-.\bin\edge-bridge.exe --state-dir .\state work-apply <project_id> fix1            # يعرض ما سيتغير فقط
-.\bin\edge-bridge.exe --state-dir .\state work-apply <project_id> fix1 --confirm  # يطبّق
+.\apply.ps1 fix1
 ```
 
-`work-apply` يغيّر كل الملفات أو لا شيء. يرفض إذا تغيّر ملف في المشروع بعد أن نسخه الـ model، ويطبع journal id يرجّع به `rollback-patch` كل شيء:
+الأمر `apply.ps1` يعرض ما سيتغير أولًا (dry run)، يسأل `y/N`، ويطبّق كل الملفات أو لا شيء. يرفض إذا تغيّر ملف في المشروع بعد أن نسخه الـ model، ويطبع `journal_id` وأمر التراجع الدقيق:
 
 ```powershell
-.\bin\edge-bridge.exe --state-dir .\state rollback-patch --project-root <مجلد المشروع> --journal-id <journal id>
+.\rollback.ps1 <journal_id>
 ```
 
 ### حدود لازم تعرفها
 
 - التشغيل الواحد أقصاه 60 ثانية، ويشتغل `unittest` من المكتبة القياسية فقط. مشروع يحتاج `pytest` أو `numpy` أو مكتبات أخرى لا يُختبر حاليًا.
-- اختبارات المشروع نفسه تشتغل فقط إذا كان المشروع صغيرًا: 32 ملفًا كحد أقصى و64 KiB للملف. المشاريع الأكبر تُرفض بالرمز `RESOURCE_BUDGET_EXCEEDED`.
-- الـ model لا يقدر يختبر تعديله هو افتراضيًا. الأمر `start-worker.ps1 --allow-work-exec` يفتح ذلك، وعندها يشتغل كود كتبه الـ model داخل الـ sandbox على جهازك. القياس على جهاز واحد: لا شبكة ولا مجلدات خارج النسخة، لكن الكود يقدر يقرأ اسم المستخدم ومسارات الـ profile ومفاتيح السجل `HKCU\Software` و `HKLM\Software` و `HKCU\Environment`. افتحه فقط إذا قبلت هذا.
+- تشغيل الاختبارات يعمل على لقطة (snapshot) أقصاها 128 ملفًا و256 KiB للملف و4 MiB بالمجموع. المشروع الأكبر يُرفض بالرمز `RESOURCE_BUDGET_EXCEEDED`، والرفض يذكر الحد والقيمة المقاسة. مجلد الاختبارات لا يحتاج `__init__.py`.
+- الـ model لا يقدر يختبر تعديله هو افتراضيًا. الأمر `.\start.ps1 -AllowWorkExec` (يعرض تحذيرًا ويسأل `y/N` أولًا) أو `.\start-worker.ps1 --allow-work-exec` يفتح ذلك، وعندها يشتغل كود كتبه الـ model داخل الـ sandbox على جهازك. القياس على جهاز واحد: لا شبكة ولا مجلدات خارج النسخة، لكن الكود يقدر يقرأ اسم المستخدم ومسارات الـ profile ومفاتيح السجل `HKCU\Software` و `HKLM\Software` و `HKCU\Environment`. افتحه فقط إذا قبلت هذا.
 - تشغيل الاختبارات يحتاج الإصدارين المثبّتين بالضبط: PowerShell `7.7.0` و `@openai/codex@0.171.0`. حزمة Codex تُستخدم كمحرك sandbox فقط؛ لا تحتاج حساب OpenAI ولا model. إذا تحدّث أحدهما تفشل الاختبارات حتى يُحدَّث التثبيت في المشروع.
 - هذا إصدار تجريبي (prerelease) جُرّب على جهاز واحد. ملف `SHA256SUMS.txt` من الإصدار نفسه يكشف تلف التنزيل فقط، ولا يثبت من نشر الإصدار.
 
